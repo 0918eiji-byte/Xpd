@@ -951,13 +951,30 @@ function recruitmentSettingFromRow(row, index) {
   };
 }
 
+function sheetCellInputValue(cell) {
+  const richLink = (cell?.chipRuns || [])
+    .map((run) => run.chip?.richLinkProperties?.uri)
+    .find(Boolean);
+  if (richLink) return richLink;
+  const value = cell?.userEnteredValue || {};
+  if (value.stringValue !== undefined) return value.stringValue;
+  if (value.numberValue !== undefined) return value.numberValue;
+  if (value.boolValue !== undefined) return value.boolValue;
+  return "";
+}
+
 async function readRecruitmentSettings() {
-  const response = await sheets.spreadsheets.values.get({
+  const response = await sheets.spreadsheets.get({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!A4:K100`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+    ranges: [`'${recruitmentSettingsSheetName}'!A4:K100`],
+    includeGridData: true,
+    fields: "sheets.data.rowData.values(userEnteredValue,chipRuns)",
   });
-  return (response.data.values || []).map(recruitmentSettingFromRow).filter((setting) => setting.roundName);
+  const rows = response.data.sheets?.[0]?.data?.[0]?.rowData || [];
+  return rows
+    .map((row) => (row.values || []).map(sheetCellInputValue))
+    .map(recruitmentSettingFromRow)
+    .filter((setting) => setting.roundName);
 }
 
 async function writeRecruitmentStatus(setting, status) {
