@@ -43,7 +43,10 @@ const client = new Client({
 
 let queue = Promise.resolve();
 function enqueue(label, work) {
-  queue = queue.then(work).catch((error) => console.error(`[${label}]`, error));
+  queue = queue.then(work).catch((error) => {
+    const message = error.response?.data?.error?.message || error.message || error;
+    console.error(`[${label}]`, message);
+  });
   return queue;
 }
 
@@ -155,9 +158,22 @@ function employeeId(discordId) {
   return `DC-${discordId}`;
 }
 
-async function syncMember(member) {
+async function applyEmployeeUpdates(data, context) {
+  if (context?.pendingData) {
+    context.pendingData.push(...data);
+    return;
+  }
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: { valueInputOption: "USER_ENTERED", data },
+  });
+}
+
+async function syncMember(member, context = null) {
   if (member.guild.id !== guildId || member.user.bot) return;
-  const [rankMap, employeeSheet] = await Promise.all([readRankMap(), readEmployees()]);
+  const [rankMap, employeeSheet] = context
+    ? [context.rankMap, context.employeeSheet]
+    : await Promise.all([readRankMap(), readEmployees()]);
   const discordColumn = employeeSheet.headerMap.get("DiscordユーザーID");
   const idColumn = employeeSheet.headerMap.get("社員ID");
   const index = employeeSheet.rows.findIndex((row) => String(row[discordColumn] || "") === member.id);
@@ -170,34 +186,29 @@ async function syncMember(member) {
 
   if (!eligible) {
     if (index < 0) return;
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: rowUpdate(employeeSheet, targetRow, { "雇用状態": hasExcludeRole ? "休職" : "退職", "Discordロール": "", "同期ランク": "", "最終同期": now, "メモ": hasExcludeRole ? "除外ロールあり" : "対象ロールなし" }),
-      },
-    });
+    await applyEmployeeUpdates(
+      rowUpdate(employeeSheet, targetRow, { "雇用状態": hasExcludeRole ? "休職" : "退職", "Discordロール": "", "同期ランク": "", "最終同期": now, "メモ": hasExcludeRole ? "除外ロールあり" : "対象ロールなし" }),
+      context,
+    );
     console.log(`名簿対象外: ${member.displayName}`);
     return;
   }
 
   const assessed = assessMember(member, rankMap);
   if (index < 0) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "DiscordユーザーID": member.id, "入社日": member.joinedAt?.toISOString() || now, "雇用状態": "在籍", "手動ランク": "", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, ...employeeFormulas(employeeSheet, targetRow), "最終同期": now, "メモ": "Railway Bot自動登録" }),
-      },
-    });
+    await applyEmployeeUpdates(
+      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "DiscordユーザーID": member.id, "入社日": member.joinedAt?.toISOString() || now, "雇用状態": "在籍", "手動ランク": "", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, ...employeeFormulas(employeeSheet, targetRow), "最終同期": now, "メモ": "Railway Bot自動登録" }),
+      context,
+    );
+    const rowIndex = targetRow - 3;
+    while (employeeSheet.rows.length <= rowIndex) employeeSheet.rows.push([]);
+    employeeSheet.rows[rowIndex][idColumn] = employeeId(member.id);
+    employeeSheet.rows[rowIndex][discordColumn] = member.id;
   } else {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "DiscordユーザーID": member.id, "雇用状態": "在籍", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, "最終同期": now, "メモ": "Railway Botリアルタイム同期" }),
-      },
-    });
+    await applyEmployeeUpdates(
+      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "DiscordユーザーID": member.id, "雇用状態": "在籍", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, "最終同期": now, "メモ": "Railway Botリアルタイム同期" }),
+      context,
+    );
   }
   console.log(`同期完了: ${member.displayName} → ${assessed.rankName || "階級なし"}`);
 }
@@ -220,7 +231,15 @@ async function fullSync() {
   if (eligibleCount === 0) {
     throw new Error("名簿対象者が0人です。ROSTER_ROLE_IDが全署員に共通するロールか確認してください。");
   }
-  for (const member of members.values()) await syncMember(member);
+  const [rankMap, employeeSheet] = await Promise.all([readRankMap(), readEmployees()]);
+  const context = { rankMap, employeeSheet, pendingData: [] };
+  for (const member of members.values()) await syncMember(member, context);
+  if (context.pendingData.length) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: context.pendingData },
+    });
+  }
   console.log(`全件同期完了: ${members.size}人確認`);
 }
 
@@ -241,7 +260,7 @@ async function markRemoved(member) {
   console.log(`脱退処理: ${member.displayName || member.user.username}`);
 }
 
-client.once("ready", () => {
+client.once("clientReady", () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
   enqueue("起動時全件同期", fullSync);
 });
