@@ -100,7 +100,7 @@ function columnLetter(index) {
 }
 
 const actionHeaders = ["昇格", "降格", "解雇"];
-const botHeaders = ["社員ID", "表示名", "DiscordユーザーID", "入社日", "雇用状態", "手動ランク", "Discordロール", "同期ランク", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", "最終同期", "メモ", ...actionHeaders, "操作結果", "操作日時"];
+const botHeaders = ["社員ID", "表示名", "雇用状態", "Discordロール", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", "最終同期", "メモ", ...actionHeaders, "操作結果", "操作日時"];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
@@ -154,14 +154,11 @@ function ref(employeeSheet, header, rowNumber) {
 function employeeFormulas(employeeSheet, rowNumber) {
   const id = ref(employeeSheet, "社員ID", rowNumber);
   const status = ref(employeeSheet, "雇用状態", rowNumber);
-  const manualRank = ref(employeeSheet, "手動ランク", rowNumber);
-  const syncedRank = ref(employeeSheet, "同期ランク", rowNumber);
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
   const base = ref(employeeSheet, "基本ボーナス", rowNumber);
   const factor = ref(employeeSheet, "固定係数", rowNumber);
   const adjustment = ref(employeeSheet, "調整額", rowNumber);
   return {
-    "適用ランク": `=IF(${manualRank}<>"",${manualRank},${syncedRank})`,
     "基本ボーナス": `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
     "固定係数": `=IF(${id}="","",1)`,
     "調整額": 0,
@@ -206,10 +203,7 @@ function discordIdCell(discordId) {
 }
 
 function normalizedDiscordId(row, employeeSheet) {
-  const discordIndex = employeeSheet.headerMap.get("DiscordユーザーID");
   const employeeIndex = employeeSheet.headerMap.get("社員ID");
-  const direct = String(row[discordIndex] || "").replace(/^'/, "").trim();
-  if (direct) return direct;
   return String(row[employeeIndex] || "").replace(/^DC-/, "").trim();
 }
 
@@ -260,16 +254,46 @@ async function applyEmployeeUpdates(data, context) {
   });
 }
 
+async function sortEmployees(employeeSheet) {
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        sortRange: {
+          range: {
+            sheetId: employeeSheetId,
+            startRowIndex: 2,
+            endRowIndex: 1000,
+            startColumnIndex: 0,
+            endColumnIndex: Math.max(employeeSheet.headers.length, botHeaders.length),
+          },
+          sortSpecs: [{ dimensionIndex: 0, sortOrder: "ASCENDING" }],
+        },
+      }],
+    },
+  });
+}
+
+async function clearEmployeeRow(employeeSheet, rowNumber, context = null) {
+  const range = `'従業員'!A${rowNumber}:ZZ${rowNumber}`;
+  if (context?.pendingClearRanges) {
+    context.pendingClearRanges.push(range);
+    return;
+  }
+  await sheets.spreadsheets.values.batchClear({
+    spreadsheetId,
+    requestBody: { ranges: [range] },
+  });
+  await sortEmployees(employeeSheet);
+}
+
 async function syncMember(member, context = null) {
   if (member.guild.id !== guildId || member.user.bot) return;
   const [rankMap, employeeSheet] = context
     ? [context.rankMap, context.employeeSheet]
     : await Promise.all([readRankMap(), readEmployees()]);
-  const discordColumn = employeeSheet.headerMap.get("DiscordユーザーID");
   const idColumn = employeeSheet.headerMap.get("社員ID");
-  const index = employeeSheet.rows.findIndex((row) =>
-    String(row[discordColumn] || "") === member.id || String(row[idColumn] || "") === employeeId(member.id),
-  );
+  const index = employeeSheet.rows.findIndex((row) => String(row[idColumn] || "") === employeeId(member.id));
   const emptyIndex = employeeSheet.rows.findIndex((row) => !row[idColumn]);
   const targetRow = index >= 0 ? index + 3 : emptyIndex >= 0 ? emptyIndex + 3 : employeeSheet.rows.length + 3;
   const hasRosterRole = [...rosterRoleIds].some((id) => member.roles.cache.has(id));
@@ -277,23 +301,28 @@ async function syncMember(member, context = null) {
   const dismissal = dismissedRank(rankMap);
   const hasDismissedRole = Boolean(dismissal && member.roles.cache.has(dismissal.roleId));
   const assessed = assessMember(member, rankMap);
+  const hasAnyRole = member.roles.cache.some((role) => role.id !== member.guild.id);
   const now = new Date().toISOString();
+
+  if (!hasAnyRole) {
+    if (index >= 0) await clearEmployeeRow(employeeSheet, targetRow, context);
+    console.log(`ロールなしのため名簿削除: ${member.displayName}`);
+    return;
+  }
 
   if (hasDismissedRole) {
     const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
-    const syncedRankColumn = employeeSheet.headerMap.get("同期ランク");
     const previousRank = assessed.rankName || (index >= 0
-      ? String(employeeSheet.rows[index][appliedRankColumn] || employeeSheet.rows[index][syncedRankColumn] || "").trim()
+      ? String(employeeSheet.rows[index][appliedRankColumn] || "").trim()
       : "");
     await upsertTerminationRecord(member, previousRank);
     if (index >= 0) {
       await applyEmployeeUpdates(
         rowUpdate(employeeSheet, targetRow, {
           "表示名": member.displayName,
-          "DiscordユーザーID": discordIdCell(member.id),
           "雇用状態": "退職",
           "Discordロール": dismissal.roleName,
-          "同期ランク": "",
+          "適用ランク": previousRank,
           "最終同期": now,
           "メモ": "解雇者ロール検知",
         }),
@@ -309,29 +338,30 @@ async function syncMember(member, context = null) {
   if (!eligible) {
     if (index < 0) return;
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "雇用状態": hasExcludeRole ? "休職" : "退職", "Discordロール": "", "同期ランク": "", "最終同期": now, "メモ": hasExcludeRole ? "除外ロールあり" : "対象ロールなし" }),
+      rowUpdate(employeeSheet, targetRow, { "雇用状態": hasExcludeRole ? "休職" : "退職", "Discordロール": "", "適用ランク": "", "最終同期": now, "メモ": hasExcludeRole ? "除外ロールあり" : "対象ロールなし" }),
       context,
     );
     console.log(`名簿対象外: ${member.displayName}`);
     return;
   }
 
+  const appliedRank = assessed.rankName || "？？？？";
+
   if (index < 0) {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "DiscordユーザーID": discordIdCell(member.id), "入社日": member.joinedAt?.toISOString() || now, "雇用状態": "在籍", "手動ランク": "", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, ...employeeFormulas(employeeSheet, targetRow), "最終同期": now, "メモ": "Railway Bot自動登録" }),
+      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "雇用状態": "在籍", "Discordロール": assessed.roleNames, "適用ランク": appliedRank, ...employeeFormulas(employeeSheet, targetRow), "最終同期": now, "メモ": assessed.rankName ? "Railway Bot自動登録" : "Police Officerのみ・階級未設定" }),
       context,
     );
     const rowIndex = targetRow - 3;
     while (employeeSheet.rows.length <= rowIndex) employeeSheet.rows.push([]);
     employeeSheet.rows[rowIndex][idColumn] = employeeId(member.id);
-    employeeSheet.rows[rowIndex][discordColumn] = member.id;
   } else {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "DiscordユーザーID": discordIdCell(member.id), "雇用状態": "在籍", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, "最終同期": now, "メモ": "Railway Botリアルタイム同期" }),
+      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "雇用状態": "在籍", "Discordロール": assessed.roleNames, "適用ランク": appliedRank, "最終同期": now, "メモ": assessed.rankName ? "Railway Botリアルタイム同期" : "Police Officerのみ・階級未設定" }),
       context,
     );
   }
-  console.log(`同期完了: ${member.displayName} → ${assessed.rankName || "階級なし"}`);
+  console.log(`同期完了: ${member.displayName} → ${appliedRank}`);
 }
 
 async function consolidateEmployeeDuplicates() {
@@ -348,7 +378,7 @@ async function consolidateEmployeeDuplicates() {
   if (!duplicateGroups.length) return 0;
 
   const systemHeaders = new Set([
-    "社員ID", "表示名", "DiscordユーザーID", "雇用状態", "Discordロール", "同期ランク",
+    "社員ID", "表示名", "雇用状態", "Discordロール",
     "適用ランク", "基本ボーナス", "見込ボーナス", "最終同期", ...actionHeaders, "操作結果", "操作日時",
   ]);
   const mergeHeaders = employeeSheet.headers.filter((header) => header && !systemHeaders.has(String(header)));
@@ -507,7 +537,7 @@ async function processSheetActions() {
     if (!discordId) {
       await writeActionResult(employeeSheet, rowNumber, {
         ...resetFields,
-        "操作結果": "エラー: DiscordユーザーIDがありません",
+        "操作結果": "エラー: 社員IDからDiscordユーザーIDを判別できません",
         "操作日時": new Date().toISOString(),
       });
       continue;
@@ -519,7 +549,6 @@ async function processSheetActions() {
       const result = await executeRankAction(guild, member, rankMap, action);
       await writeActionResult(employeeSheet, rowNumber, {
         ...resetFields,
-        "手動ランク": "",
         "雇用状態": action === "解雇" ? "退職" : "在籍",
         "操作結果": `完了: ${action} (${result.transition})`,
         "操作日時": new Date().toISOString(),
@@ -646,32 +675,33 @@ async function fullSync() {
   }
   await consolidateEmployeeDuplicates();
   const employeeSheet = await readEmployees();
-  const context = { rankMap, employeeSheet, pendingData: [] };
+  const context = { rankMap, employeeSheet, pendingData: [], pendingClearRanges: [] };
   for (const member of members.values()) await syncMember(member, context);
+  if (context.pendingClearRanges.length) {
+    await sheets.spreadsheets.values.batchClear({
+      spreadsheetId,
+      requestBody: { ranges: [...new Set(context.pendingClearRanges)] },
+    });
+  }
   if (context.pendingData.length) {
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: { valueInputOption: "USER_ENTERED", data: context.pendingData },
     });
   }
+  if (context.pendingClearRanges.length) await sortEmployees(employeeSheet);
   console.log(`全件同期完了: ${members.size}人確認`);
 }
 
 async function markRemoved(member) {
   if (member.guild.id !== guildId || member.user.bot) return;
   const employeeSheet = await readEmployees();
-  const discordColumn = employeeSheet.headerMap.get("DiscordユーザーID");
-  const index = employeeSheet.rows.findIndex((row) => String(row[discordColumn] || "") === member.id);
+  const idColumn = employeeSheet.headerMap.get("社員ID");
+  const index = employeeSheet.rows.findIndex((row) => String(row[idColumn] || "") === employeeId(member.id));
   if (index < 0) return;
   const rowNumber = index + 3;
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: rowUpdate(employeeSheet, rowNumber, { "雇用状態": "退職", "Discordロール": "", "同期ランク": "", "最終同期": new Date().toISOString(), "メモ": "Discordサーバー脱退" }),
-    },
-  });
-  console.log(`脱退処理: ${member.displayName || member.user.username}`);
+  await clearEmployeeRow(employeeSheet, rowNumber);
+  console.log(`Discordサーバー脱退のため名簿削除: ${member.displayName || member.user.username}`);
 }
 
 client.once("clientReady", () => {
