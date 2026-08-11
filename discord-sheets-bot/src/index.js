@@ -167,7 +167,8 @@ function columnLetter(index) {
 }
 
 const rankSelectionHeader = "変更後ランク";
-const actionTriggerHeader = "実行";
+const actionTriggerHeader = "実行ボタン";
+const legacyActionTriggerHeader = "実行";
 const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時"];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
@@ -181,7 +182,12 @@ async function readEmployees() {
   });
   const values = response.data.values || [];
   let headers = values[0] || [];
-  const missingHeaders = botHeaders.filter((header) => !headers.includes(header));
+  const missingHeaders = botHeaders.filter((header) => {
+    if (header === actionTriggerHeader) {
+      return !headers.includes(actionTriggerHeader) && !headers.includes(legacyActionTriggerHeader);
+    }
+    return !headers.includes(header);
+  });
   if (missingHeaders.length) {
     const start = Math.max(headers.length, 1);
     const end = start + missingHeaders.length - 1;
@@ -194,9 +200,13 @@ async function readEmployees() {
     headers = [...headers, ...missingHeaders];
     console.log(`見出しを自動追加: ${missingHeaders.join(", ")}`);
   }
+  const headerMap = new Map(headers.map((header, index) => [String(header), index]));
+  if (!headerMap.has(actionTriggerHeader) && headerMap.has(legacyActionTriggerHeader)) {
+    headerMap.set(actionTriggerHeader, headerMap.get(legacyActionTriggerHeader));
+  }
   return {
     headers,
-    headerMap: new Map(headers.map((header, index) => [String(header), index])),
+    headerMap,
     rows: values.slice(1),
   };
 }
