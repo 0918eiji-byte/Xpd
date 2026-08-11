@@ -183,7 +183,9 @@ const rankSelectionHeader = "変更後ランク";
 const actionTriggerHeader = "実行ボタン";
 const legacyActionTriggerHeader = "実行";
 const sortPriorityHeader = "階級順序";
-const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
+const bonusFactorHeader = "ランク係数";
+const legacyBonusFactorHeader = "固定係数";
+const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", bonusFactorHeader, "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
@@ -199,6 +201,9 @@ async function readEmployees() {
   const missingHeaders = botHeaders.filter((header) => {
     if (header === actionTriggerHeader) {
       return !headers.includes(actionTriggerHeader) && !headers.includes(legacyActionTriggerHeader);
+    }
+    if (header === bonusFactorHeader) {
+      return !headers.includes(bonusFactorHeader) && !headers.includes(legacyBonusFactorHeader);
     }
     return !headers.includes(header);
   });
@@ -217,6 +222,9 @@ async function readEmployees() {
   const headerMap = new Map(headers.map((header, index) => [String(header), index]));
   if (!headerMap.has(actionTriggerHeader) && headerMap.has(legacyActionTriggerHeader)) {
     headerMap.set(actionTriggerHeader, headerMap.get(legacyActionTriggerHeader));
+  }
+  if (!headerMap.has(bonusFactorHeader) && headerMap.has(legacyBonusFactorHeader)) {
+    headerMap.set(bonusFactorHeader, headerMap.get(legacyBonusFactorHeader));
   }
   return {
     headers,
@@ -248,13 +256,12 @@ function employeeFormulas(employeeSheet, rowNumber) {
   const discordRoles = ref(employeeSheet, "Discordロール", rowNumber);
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
   const base = ref(employeeSheet, "基本ボーナス", rowNumber);
-  const factor = ref(employeeSheet, "固定係数", rowNumber);
   const adjustment = ref(employeeSheet, "調整額", rowNumber);
   return {
-    "基本ボーナス": `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
-    "固定係数": `=IF(${id}="","",1)`,
+    "基本ボーナス": `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ボーナス計算機'!$A$16:$A$30,'ボーナス計算機'!$H$16:$H$30),0))`,
+    [bonusFactorHeader]: `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
     "調整額": 0,
-    "見込ボーナス": `=IF(${id}="","",IF(${discordRoles}="解雇者",0,${base}*${factor}+${adjustment}))`,
+    "見込ボーナス": `=IF(${id}="","",IF(${discordRoles}="解雇者",0,${base}+${adjustment}))`,
   };
 }
 
@@ -506,7 +513,7 @@ async function consolidateEmployeeDuplicates() {
 
   const systemHeaders = new Set([
     "社員ID", "表示名", "Discordロール", "適用ランク",
-    "基本ボーナス", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
+    "基本ボーナス", bonusFactorHeader, legacyBonusFactorHeader, "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
   ]);
   const mergeHeaders = employeeSheet.headers.filter((header) => header && !systemHeaders.has(String(header)));
   const mergeData = [];
