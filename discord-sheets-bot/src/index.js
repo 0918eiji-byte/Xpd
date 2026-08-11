@@ -116,6 +116,18 @@ async function removeRosterRoles(guild, member, reason) {
   return roles.map((role) => role.name);
 }
 
+async function removeAllEditableRoles(guild, member, reason) {
+  const removableRoles = member.roles.cache.filter((role) =>
+    role.id !== guild.id && !role.managed,
+  );
+  const blockedRoles = removableRoles.filter((role) => !role.editable);
+  if (blockedRoles.size) {
+    throw new Error(`Botより上位のため全ロールを解除できません: ${blockedRoles.map((role) => role.name).join(", ")}`);
+  }
+  if (removableRoles.size) await member.roles.remove([...removableRoles.keys()], reason);
+  return removableRoles.map((role) => role.name);
+}
+
 async function applySelectedRank(guild, member, rankMap, requestedRank, reason) {
   const selected = String(requestedRank || "").trim();
   const ranks = sortedRanks(rankMap);
@@ -273,6 +285,7 @@ async function readTerminations() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `'${terminationSheetName}'!A2:K500`,
+    valueRenderOption: "UNFORMATTED_VALUE",
   });
   const values = response.data.values || [];
   const headers = values[0] || terminationHeaders;
@@ -310,6 +323,34 @@ function isChecked(value) {
   return value === true || String(value || "").toUpperCase() === "TRUE";
 }
 
+function parseSheetDate(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date((value - 25569) * 24 * 60 * 60 * 1000 - 9 * 60 * 60 * 1000);
+  }
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const localMatch = text.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  const parsed = localMatch
+    ? new Date(`${localMatch[1]}-${localMatch[2]}-${localMatch[3]}T${localMatch[4]}:${localMatch[5]}:${localMatch[6] || "00"}+09:00`)
+    : new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function sheetDateTime(date) {
+  const parts = new Intl.DateTimeFormat("ja-JP-u-ca-gregory", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}/${values.month}/${values.day} ${values.hour}:${values.minute}:${values.second}`;
+}
+
 async function upsertTerminationRecord(member, finalRank = "") {
   const terminationSheet = await readTerminations();
   const employeeIdColumn = terminationSheet.headerMap.get("社員ID");
@@ -329,7 +370,7 @@ async function upsertTerminationRecord(member, finalRank = "") {
   };
   if (finalRank && !existingRank) fields["最終ランク"] = finalRank;
   if (index < 0) {
-    fields["解雇日"] = new Date().toISOString();
+    fields["解雇日"] = sheetDateTime(new Date());
     fields["手続き完了"] = false;
   }
   await sheets.spreadsheets.values.batchUpdate({
@@ -663,9 +704,8 @@ async function processSheetActions() {
 async function processTerminations() {
   const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
   const completeColumn = terminationSheet.headerMap.get("手続き完了");
-  const handlerColumn = terminationSheet.headerMap.get("対応署員");
   const completedAtColumn = terminationSheet.headerMap.get("完了日");
-  const deletionStatusColumn = terminationSheet.headerMap.get("名簿削除状況");
+  const deletionAtColumn = terminationSheet.headerMap.get("名簿削除予定日");
   const noteColumn = terminationSheet.headerMap.get("備考");
   const terminationEmployeeIdColumn = terminationSheet.headerMap.get("社員ID");
   const terminationDiscordIdColumn = terminationSheet.headerMap.get("DiscordユーザーID");
@@ -673,42 +713,81 @@ async function processTerminations() {
   const now = new Date();
   const terminationUpdates = [];
   const employeeRangesToClear = [];
+  const terminationRangesToClear = [];
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
 
   for (let index = 0; index < terminationSheet.rows.length; index += 1) {
     const row = terminationSheet.rows[index];
     if (!String(row[terminationEmployeeIdColumn] || "").trim()) continue;
     if (!isChecked(row[completeColumn])) continue;
-    if (!String(row[handlerColumn] || "").trim()) continue;
-    if (String(row[deletionStatusColumn] || "").trim() === "削除済") continue;
 
     const rowNumber = index + 3;
-    const completedAtText = String(row[completedAtColumn] || "").trim();
-    if (!completedAtText) {
-      terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, { "完了日": now.toISOString() }));
-      console.log(`退職手続き完了日を記録: ${row[terminationEmployeeIdColumn]}`);
+    let completedAt = parseSheetDate(row[completedAtColumn]);
+    let deletionAt = parseSheetDate(row[deletionAtColumn]);
+    if (!completedAt) {
+      completedAt = now;
+      deletionAt = new Date(completedAt.getTime() + retentionPeriodMs);
+      terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, {
+        "完了日": sheetDateTime(completedAt),
+        "名簿削除予定日": sheetDateTime(deletionAt),
+      }));
+      console.log(`退職手続き完了日・削除予定日を記録: ${row[terminationEmployeeIdColumn]}`);
       continue;
     }
-
-    const completedAt = new Date(completedAtText);
-    if (Number.isNaN(completedAt.getTime()) || now.getTime() < completedAt.getTime() + retentionPeriodMs) continue;
+    if (!deletionAt) {
+      deletionAt = new Date(completedAt.getTime() + retentionPeriodMs);
+      terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, {
+        "名簿削除予定日": sheetDateTime(deletionAt),
+      }));
+    }
+    if (now.getTime() < deletionAt.getTime()) continue;
 
     const discordId = String(row[terminationDiscordIdColumn] || "").replace(/^'/, "").trim();
     const terminatedEmployeeId = String(row[terminationEmployeeIdColumn] || "").trim();
+    try {
+      if (!discordId) throw new Error("DiscordユーザーIDが空です");
+      let member = null;
+      try {
+        member = await guild.members.fetch(discordId);
+      } catch (error) {
+        if (error.code !== 10007) throw error;
+      }
+      if (member) {
+        const removedRoles = await removeAllEditableRoles(
+          guild,
+          member,
+          "退職手続き完了から7日経過したため全ロールを自動解除",
+        );
+        console.log(`解雇者の全ロール解除: ${member.displayName} (${removedRoles.join(", ") || "解除対象なし"})`);
+      }
+    } catch (error) {
+      const message = error.response?.data?.message || error.message || String(error);
+      const currentNote = String(row[noteColumn] || "").trim();
+      const errorNote = `自動削除エラー: ${message}`;
+      terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, {
+        "備考": currentNote.includes(errorNote) ? currentNote : [currentNote, errorNote].filter(Boolean).join(" / "),
+      }));
+      console.error(`解雇者の自動削除失敗: ${terminatedEmployeeId}`, message);
+      continue;
+    }
+
     const employeeIndex = employeeSheet.rows.findIndex((employeeRow) => {
       const candidateDiscordId = normalizedDiscordId(employeeRow, employeeSheet);
       return (discordId && candidateDiscordId === discordId)
         || String(employeeRow[employeeIdColumn] || "").trim() === terminatedEmployeeId;
     });
     if (employeeIndex >= 0) employeeRangesToClear.push(`'従業員'!A${employeeIndex + 3}:ZZ${employeeIndex + 3}`);
-    const currentNote = String(row[noteColumn] || "").trim();
-    const deletionNote = `退職手続き完了から7日経過のため名簿から自動削除: ${now.toISOString()}`;
-    terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, {
-      "名簿削除状況": "削除済",
-      "備考": [currentNote, deletionNote].filter(Boolean).join(" / "),
-    }));
-    console.log(`名簿自動削除: ${terminatedEmployeeId}`);
+    terminationRangesToClear.push(`'${terminationSheetName}'!A${rowNumber}:H${rowNumber}`);
+    terminationRangesToClear.push(`'${terminationSheetName}'!K${rowNumber}:K${rowNumber}`);
+    console.log(`解雇者記録を自動削除: ${terminatedEmployeeId}`);
   }
 
+  if (terminationUpdates.length) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: terminationUpdates },
+    });
+  }
   if (employeeRangesToClear.length) {
     await sheets.spreadsheets.values.batchClear({
       spreadsheetId,
@@ -716,10 +795,10 @@ async function processTerminations() {
     });
     await sortEmployees(employeeSheet);
   }
-  if (terminationUpdates.length) {
-    await sheets.spreadsheets.values.batchUpdate({
+  if (terminationRangesToClear.length) {
+    await sheets.spreadsheets.values.batchClear({
       spreadsheetId,
-      requestBody: { valueInputOption: "USER_ENTERED", data: terminationUpdates },
+      requestBody: { ranges: [...new Set(terminationRangesToClear)] },
     });
   }
 }
