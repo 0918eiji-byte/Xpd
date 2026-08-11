@@ -1284,28 +1284,40 @@ async function fetchApplicationPoll(application, setting) {
 
 async function sendApplicationPass(setting, application) {
   const channel = await textChannel(setting.passChannelId, "合格発表");
-  const title = `${setting.roundName} 合格発表`;
   const userId = await resolveApplicantDiscordUserId(application.discordId);
-  if (channel.messages && typeof channel.messages.fetch === "function") {
-    const recentMessages = await channel.messages.fetch({ limit: 100 });
-    const existing = recentMessages.find((message) => (
-      message.author?.id === client.user?.id
-      && message.embeds.some((embed) => embed.title === title && embed.url === applicationLink(application.rowNumber))
-    ));
-    if (existing) {
-      return { messageId: existing.id, applicantMatched: Boolean(userId) };
-    }
-  }
-
-  const content = [setting.passMessage, userId ? `<@${userId}>` : ""].filter(Boolean).join("\n");
-  const embed = applicationEmbed(application, title, 0x16a34a)
-    .setDescription(`投票結果: 合格票 ${application.passVotes}/${application.totalVotes}票`);
+  const content = [setting.passMessage || "合格が決定しました。", userId ? `<@${userId}>` : ""]
+    .filter(Boolean)
+    .join("\n");
   const message = await channel.send({
-    content: content || undefined,
-    embeds: [embed],
+    content,
     allowedMentions: { users: userId ? [userId] : [] },
+    nonce: `pass-${application.id}`,
+    enforceNonce: true,
   });
   return { messageId: message.id, applicantMatched: Boolean(userId) };
+}
+
+async function sanitizeApplicationPass(setting, application) {
+  const channel = await textChannel(setting.passChannelId, "合格発表");
+  if (!channel.messages || typeof channel.messages.fetch !== "function") return false;
+  const message = await channel.messages.fetch({
+    message: application.passAnnouncementMessageId,
+    force: true,
+  });
+  if (message.author?.id !== client.user?.id) return false;
+
+  const userId = await resolveApplicantDiscordUserId(application.discordId);
+  const content = [setting.passMessage || "合格が決定しました。", userId ? `<@${userId}>` : ""]
+    .filter(Boolean)
+    .join("\n");
+  if (message.content !== content || message.embeds.length > 0) {
+    await message.edit({
+      content,
+      embeds: [],
+      allowedMentions: { users: userId ? [userId] : [] },
+    });
+  }
+  return Boolean(userId);
 }
 
 async function writeApplicationAnnouncementState(rowNumber, messageId, result) {
@@ -1493,7 +1505,7 @@ async function processRecruitmentApplications() {
           && !application.passAnnouncementMessageId) {
           try {
             const announcement = await sendApplicationPass(setting, application);
-            const result = `${application.processResult || "投票結果を確定"} / 合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+            const result = `${application.processResult || "投票結果を確定"} / 合格発表済（書類非表示）${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
             await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
             application.passAnnouncementMessageId = announcement.messageId;
             application.processResult = result;
@@ -1504,6 +1516,24 @@ async function processRecruitmentApplications() {
               range: `'${applicationSheetName}'!X${application.rowNumber}`,
               valueInputOption: "RAW",
               requestBody: { values: [[`合格発表エラー: ${error.message}`]] },
+            });
+          }
+        } else if (application.pollStatus === "FINAL"
+          && application.verdict === "合格"
+          && setting.passChannelId
+          && application.passAnnouncementMessageId
+          && !String(application.processResult || "").includes("書類非表示")) {
+          try {
+            const applicantMatched = await sanitizeApplicationPass(setting, application);
+            const result = `${application.processResult || "投票結果を確定"} / 書類非表示へ更新${applicantMatched ? "" : "（本人メンション未解決）"}`;
+            await writeApplicationAnnouncementState(application.rowNumber, application.passAnnouncementMessageId, result);
+            application.processResult = result;
+          } catch (error) {
+            await sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range: `'${applicationSheetName}'!X${application.rowNumber}`,
+              valueInputOption: "RAW",
+              requestBody: { values: [[`合格発表更新エラー: ${error.message}`]] },
             });
           }
         }
