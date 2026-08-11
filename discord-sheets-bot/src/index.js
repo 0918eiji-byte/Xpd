@@ -1537,15 +1537,21 @@ async function markRemoved(member) {
 
 client.once("clientReady", () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
-  enqueue("起動時全件同期", fullSync);
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
-  setInterval(() => enqueue("シート操作・応募・退職処理", async () => {
-    await processSheetActions();
-    await processBonusDistribution();
-    await processRecruitmentApplications();
-    await processTerminations();
-  }), actionPollInterval);
+  const initialPollDelay = Math.max(actionPollInterval, 60000);
+  const pollSheetActions = async () => {
+    await enqueue("シート操作・応募・退職処理", async () => {
+      await processSheetActions();
+      await processBonusDistribution();
+      await processRecruitmentApplications();
+      await processTerminations();
+    });
+    setTimeout(pollSheetActions, actionPollInterval);
+  };
+  enqueue("起動時全件同期", fullSync)
+    .finally(() => setTimeout(pollSheetActions, initialPollDelay));
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
+  console.log(`起動後の初回シート確認: ${initialPollDelay}ms後`);
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
 });
 client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
