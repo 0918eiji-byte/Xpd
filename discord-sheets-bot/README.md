@@ -34,6 +34,8 @@ Discord接続完了
 全件同期完了
 ```
 
+初回導入後は、Discord側のIntent設定が遅れていてもBotが30秒ごとに自動再接続します。GitHub連携のAutodeployを有効にすると、コード更新時のRedeploy操作も不要です。
+
 ## 必須の事前設定
 
 - Discord Developer PortalのBot設定で **SERVER MEMBERS INTENT** をオンにする。

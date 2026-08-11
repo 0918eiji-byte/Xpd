@@ -205,7 +205,6 @@ async function syncMember(member) {
 async function fullSync() {
   const guild = await client.guilds.fetch(guildId);
   const members = await guild.members.fetch();
-  for (const member of members.values()) await syncMember(member);
   const missingRosterRoles = [...rosterRoleIds].filter((id) => !guild.roles.cache.has(id));
   if (missingRosterRoles.length) {
     throw new Error(`ROSTER_ROLE_IDがこのサーバーに存在しません: ${missingRosterRoles.join(", ")}`);
@@ -221,6 +220,7 @@ async function fullSync() {
   if (eligibleCount === 0) {
     throw new Error("名簿対象者が0人です。ROSTER_ROLE_IDが全署員に共通するロールか確認してください。");
   }
+  for (const member of members.values()) await syncMember(member);
   console.log(`全件同期完了: ${members.size}人確認`);
 }
 
@@ -255,4 +255,13 @@ http.createServer((_req, res) => {
   res.end(client.isReady() ? "Discord Sheets Bot: OK" : "Discord Sheets Bot: starting");
 }).listen(port, () => console.log(`Health check: ${port}`));
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+async function connectDiscord() {
+  try {
+    await client.login(process.env.DISCORD_BOT_TOKEN);
+  } catch (error) {
+    console.error("Discord接続失敗。30秒後に自動再接続します:", error.message);
+    setTimeout(connectDiscord, 30000);
+  }
+}
+
+connectDiscord();
