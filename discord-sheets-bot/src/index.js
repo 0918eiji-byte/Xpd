@@ -1,5 +1,5 @@
 import http from "node:http";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, EmbedBuilder, GatewayIntentBits } from "discord.js";
 import { google } from "googleapis";
 
 const required = [
@@ -206,6 +206,10 @@ const bonusDistributionSheetName = "ボーナス配布";
 const bonusDistributionSheetId = 1863429017;
 const bonusRoundSettingsSheetName = "ボーナス回設定";
 let displayedBonusRound = "";
+const recruitmentSettingsSheetName = "募集設定";
+const applicationSheetName = "応募管理";
+const applicationSheetId = 2081134610;
+let displayedApplicationRound = "";
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -902,6 +906,443 @@ async function processBonusDistribution() {
   }
 }
 
+function extractSpreadsheetId(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+  if (match) return match[1];
+  return /^[a-zA-Z0-9_-]{20,}$/.test(text) ? text : "";
+}
+
+function normalizeFormHeader(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\s　]/g, "")
+    .replace(/[？?！!（）()「」『』・。、,.]/g, "");
+}
+
+function formValue(headers, row, aliases, fallbackIndex = -1) {
+  const normalizedAliases = aliases.map(normalizeFormHeader);
+  const exact = headers.findIndex((header) => normalizedAliases.includes(normalizeFormHeader(header)));
+  const partial = exact >= 0 ? exact : headers.findIndex((header) => {
+    const normalized = normalizeFormHeader(header);
+    return normalizedAliases.some((alias) => normalized.includes(alias) || alias.includes(normalized));
+  });
+  const index = partial >= 0 ? partial : fallbackIndex;
+  return index >= 0 ? row[index] ?? "" : "";
+}
+
+function discordNumericId(value) {
+  return String(value || "").replace(/^'/, "").match(/\d{17,20}/)?.[0] || "";
+}
+
+function recruitmentSettingFromRow(row, index) {
+  return {
+    rowNumber: index + 4,
+    enabled: String(row[0] || "").trim() === "はい",
+    roundName: String(row[1] || "").trim(),
+    publicFormUrl: String(row[2] || "").trim(),
+    responseSpreadsheetUrl: String(row[3] || "").trim(),
+    responseSheetName: String(row[4] || "").trim(),
+    reminderChannelId: String(row[5] || "").trim(),
+    passChannelId: String(row[6] || "").trim(),
+    mentionRoleId: String(row[7] || "").trim(),
+    threshold: Math.min(Math.max(Number(row[8]) || 3, 1), 5),
+    passRoleId: String(row[9] || "").trim(),
+    manualTrigger: isChecked(row[12]),
+  };
+}
+
+async function readRecruitmentSettings() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${recruitmentSettingsSheetName}'!A4:M100`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  return (response.data.values || []).map(recruitmentSettingFromRow).filter((setting) => setting.roundName);
+}
+
+async function writeRecruitmentStatus(setting, status) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${recruitmentSettingsSheetName}'!K${setting.rowNumber}:M${setting.rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
+  });
+}
+
+async function applyApplicationRoundFilter(roundName) {
+  if (!roundName || displayedApplicationRound === roundName) return;
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        setBasicFilter: {
+          filter: {
+            range: {
+              sheetId: applicationSheetId,
+              startRowIndex: 9,
+              endRowIndex: 1000,
+              startColumnIndex: 0,
+              endColumnIndex: 26,
+            },
+            criteria: {
+              24: {
+                condition: {
+                  type: "TEXT_EQ",
+                  values: [{ userEnteredValue: roundName }],
+                },
+              },
+            },
+          },
+        },
+      }],
+    },
+  });
+  displayedApplicationRound = roundName;
+}
+
+async function resolveResponseSheetName(responseSpreadsheetId, preferredName) {
+  const response = await sheets.spreadsheets.get({
+    spreadsheetId: responseSpreadsheetId,
+    fields: "sheets.properties(title,index)",
+  });
+  const properties = (response.data.sheets || []).map((sheet) => sheet.properties);
+  const preferred = properties.find((property) => property.title === preferredName);
+  if (preferred) return preferred.title;
+  const formResponses = properties.find((property) => /フォームの回答|form responses/i.test(property.title));
+  if (formResponses) return formResponses.title;
+  if (!properties.length) throw new Error("回答スプレッドシートにシートがありません");
+  return properties.sort((a, b) => a.index - b.index)[0].title;
+}
+
+function quoteSheetName(sheetName) {
+  return `'${String(sheetName).replace(/'/g, "''")}'`;
+}
+
+function responseApplication(headers, row) {
+  return {
+    submittedAt: formValue(headers, row, ["タイムスタンプ", "timestamp"], 0),
+    discordId: String(formValue(headers, row, ["Discord ID", "DiscordユーザーID"])).replace(/^'/, "").trim(),
+    name: String(formValue(headers, row, ["街での名前", "名前"])).trim(),
+    age: String(formValue(headers, row, ["年齢"])).trim(),
+    department: String(formValue(headers, row, ["希望の部署", "希望部署"])).trim(),
+    availability: String(formValue(headers, row, ["1週間での起床率と出勤可能時間", "起床率", "出勤可能時間"])).trim(),
+    experience: String(formValue(headers, row, ["PDの経験はありますか", "PD経験"])).trim(),
+    reason: String(formValue(headers, row, ["志望理由"])).trim(),
+    strength: String(formValue(headers, row, ["PD業務で得意なこと", "得意なこと"])).trim(),
+    prosCons: String(formValue(headers, row, ["自分の長所と短所", "長所と短所"])).trim(),
+    ideal: String(formValue(headers, row, ["あなたが希望する部署の理想のPDは", "理想のPD"])).trim(),
+    whitelist: String(formValue(headers, row, ["ホワイトリスト申請の文言は", "ホワイトリスト"])).trim(),
+    question: String(formValue(headers, row, ["質問等あれば記入して下さい", "質問"])).trim(),
+  };
+}
+
+function shortHash(value) {
+  let hash = 0;
+  for (const character of String(value)) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(-6);
+}
+
+function applicationId(roundName, sourceKey) {
+  const roundNumber = String(roundName).match(/\d+/)?.[0]?.padStart(2, "0") || "00";
+  return `APP-${roundNumber}-${shortHash(sourceKey)}`;
+}
+
+function applicationSheetRow(rowNumber, setting, application, sourceKey) {
+  const discordId = discordNumericId(application.discordId);
+  return [
+    applicationId(setting.roundName, sourceKey),
+    application.submittedAt,
+    discordId ? `'${discordId}` : application.discordId,
+    application.name,
+    application.age,
+    application.department,
+    application.availability,
+    application.experience,
+    application.reason,
+    application.strength,
+    application.prosCons,
+    application.ideal,
+    application.whitelist,
+    application.question,
+    false,
+    false,
+    false,
+    false,
+    false,
+    `=COUNTIF(O${rowNumber}:S${rowNumber},TRUE)`,
+    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$I$4:$I$100),3),"合格","審査中"))`,
+    "",
+    "",
+    "取込完了",
+    setting.roundName,
+    sourceKey,
+  ];
+}
+
+function applicationFromSheetRow(row, rowNumber) {
+  return {
+    rowNumber,
+    id: String(row[0] || "").trim(),
+    submittedAt: row[1] || "",
+    discordId: String(row[2] || "").replace(/^'/, "").trim(),
+    name: String(row[3] || "").trim(),
+    age: String(row[4] || "").trim(),
+    department: String(row[5] || "").trim(),
+    availability: String(row[6] || "").trim(),
+    experience: String(row[7] || "").trim(),
+    reason: String(row[8] || "").trim(),
+    strength: String(row[9] || "").trim(),
+    prosCons: String(row[10] || "").trim(),
+    ideal: String(row[11] || "").trim(),
+    whitelist: String(row[12] || "").trim(),
+    question: String(row[13] || "").trim(),
+    checks: row.slice(14, 19).filter(isChecked).length,
+    reminderSent: Boolean(row[21]),
+    passSent: Boolean(row[22]),
+    roundName: String(row[24] || "").trim(),
+  };
+}
+
+function truncateDiscord(value, maxLength = 360) {
+  const text = String(value || "").trim() || "（未記入）";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function applicationLink(rowNumber) {
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${applicationSheetId}&range=A${rowNumber}:X${rowNumber}`;
+}
+
+function applicationEmbed(application, title, color) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setURL(applicationLink(application.rowNumber))
+    .addFields(
+      { name: "応募ID", value: truncateDiscord(application.id, 100), inline: true },
+      { name: "Discord ID", value: truncateDiscord(application.discordId, 100), inline: true },
+      { name: "街での名前", value: truncateDiscord(application.name, 100), inline: true },
+      { name: "年齢", value: truncateDiscord(application.age, 100), inline: true },
+      { name: "希望部署", value: truncateDiscord(application.department, 100), inline: true },
+      { name: "PD経験", value: truncateDiscord(application.experience, 100), inline: true },
+      { name: "起床率・出勤可能時間", value: truncateDiscord(application.availability) },
+      { name: "志望理由", value: truncateDiscord(application.reason) },
+      { name: "PD業務で得意なこと", value: truncateDiscord(application.strength) },
+      { name: "長所と短所", value: truncateDiscord(application.prosCons) },
+      { name: "理想のPD", value: truncateDiscord(application.ideal) },
+      { name: "ホワイトリスト文言", value: truncateDiscord(application.whitelist) },
+      { name: "質問", value: truncateDiscord(application.question) },
+    )
+    .setFooter({ text: `${application.roundName}・応募管理シートへ移動できます` })
+    .setTimestamp();
+}
+
+async function textChannel(channelId, label) {
+  if (!/^\d{17,20}$/.test(channelId)) throw new Error(`${label}チャンネルIDが未設定です`);
+  const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
+  if (!channel?.isTextBased() || typeof channel.send !== "function") {
+    throw new Error(`${label}チャンネルへ送信できません: ${channelId}`);
+  }
+  return channel;
+}
+
+function notificationMentions(setting, application) {
+  const userId = discordNumericId(application.discordId);
+  const roleId = /^\d{17,20}$/.test(setting.mentionRoleId) ? setting.mentionRoleId : "";
+  return {
+    content: [roleId ? `<@&${roleId}>` : "", userId ? `<@${userId}>` : ""].filter(Boolean).join(" "),
+    allowedMentions: {
+      roles: roleId ? [roleId] : [],
+      users: userId ? [userId] : [],
+    },
+  };
+}
+
+async function sendApplicationReminder(setting, application) {
+  const channel = await textChannel(setting.reminderChannelId, "リマインド");
+  const mentions = notificationMentions(setting, application);
+  await channel.send({
+    ...mentions,
+    embeds: [applicationEmbed(application, `${setting.roundName} 新規応募リマインド`, 0x2563eb)],
+  });
+}
+
+async function sendApplicationPass(setting, application) {
+  let roleResult = "";
+  const userId = discordNumericId(application.discordId);
+  if (userId && /^\d{17,20}$/.test(setting.passRoleId)) {
+    try {
+      const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+      const member = guild.members.cache.get(userId) || await guild.members.fetch(userId);
+      const role = guild.roles.cache.get(setting.passRoleId) || await guild.roles.fetch(setting.passRoleId);
+      if (!role) throw new Error("付与ロールが見つかりません");
+      if (!role.editable) throw new Error("Botより上位のロールは付与できません");
+      if (!member.roles.cache.has(role.id)) await member.roles.add(role.id, `${setting.roundName}応募の合格判定`);
+      roleResult = `\n付与ロール: ${role.name}`;
+    } catch (error) {
+      roleResult = `\nロール付与のみ失敗: ${error.message}`;
+    }
+  }
+  const channel = await textChannel(setting.passChannelId, "合格通知");
+  const mentions = notificationMentions(setting, application);
+  const embed = applicationEmbed(application, `${setting.roundName} 合格判定`, 0x16a34a)
+    .setDescription(`審査チェック ${application.checks}/${setting.threshold} に到達しました。${roleResult}`);
+  await channel.send({ ...mentions, embeds: [embed] });
+}
+
+async function writeApplicationFields(rowNumber, fields) {
+  const columns = { reminder: "V", pass: "W", result: "X" };
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: Object.entries(fields).map(([key, value]) => ({
+        range: `'${applicationSheetName}'!${columns[key]}${rowNumber}`,
+        values: [[value]],
+      })),
+    },
+  });
+}
+
+async function processRecruitmentApplications() {
+  const [topResponse, settings, applicationResponse] = await Promise.all([
+    sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${applicationSheetName}'!A4:B4`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    }),
+    readRecruitmentSettings(),
+    sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${applicationSheetName}'!A11:Z1000`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    }),
+  ]);
+  const selectedRound = String(topResponse.data.values?.[0]?.[1] || "").trim();
+  if (selectedRound) await applyApplicationRoundFilter(selectedRound);
+
+  const rows = applicationResponse.data.values || [];
+  const sourceKeys = new Set(rows.map((row) => String(row[25] || "").trim()).filter(Boolean));
+  const occupiedRows = new Set(rows.map((row, index) => String(row[0] || "").trim() ? index : -1).filter((index) => index >= 0));
+
+  for (const setting of settings) {
+    if (!setting.enabled) continue;
+    try {
+      const responseSpreadsheetId = extractSpreadsheetId(setting.responseSpreadsheetUrl);
+      if (!responseSpreadsheetId) {
+        await writeRecruitmentStatus(setting, "回答スプレッドシートURL待ち");
+        continue;
+      }
+      if (setting.reminderChannelId && !/^\d{17,20}$/.test(setting.reminderChannelId)) {
+        throw new Error("リマインドチャンネルIDの形式が正しくありません");
+      }
+      if (setting.passChannelId && !/^\d{17,20}$/.test(setting.passChannelId)) {
+        throw new Error("合格通知チャンネルIDの形式が正しくありません");
+      }
+      const responseSheetName = await resolveResponseSheetName(responseSpreadsheetId, setting.responseSheetName);
+      const formResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId: responseSpreadsheetId,
+        range: `${quoteSheetName(responseSheetName)}!A1:Z1000`,
+        valueRenderOption: "UNFORMATTED_VALUE",
+      });
+      const formValues = formResponse.data.values || [];
+      const headers = formValues[0] || [];
+      if (!headers.length) throw new Error("回答シートの見出し行が空です");
+
+      const newRows = [];
+      for (let index = 1; index < formValues.length; index += 1) {
+        const responseRow = formValues[index] || [];
+        if (!responseRow.some((value) => String(value || "").trim())) continue;
+        const application = responseApplication(headers, responseRow);
+        const sourceKey = [
+          setting.roundName,
+          responseSpreadsheetId,
+          application.submittedAt,
+          application.discordId,
+          application.name,
+        ].join("|");
+        if (sourceKeys.has(sourceKey)) continue;
+        const emptyIndex = Array.from({ length: 990 }, (_, rowIndex) => rowIndex)
+          .find((rowIndex) => !occupiedRows.has(rowIndex));
+        if (emptyIndex === undefined) throw new Error("応募管理シートの保存行が不足しています");
+        const rowNumber = emptyIndex + 11;
+        const values = applicationSheetRow(rowNumber, setting, application, sourceKey);
+        newRows.push({ rowNumber, values });
+        rows[emptyIndex] = values;
+        occupiedRows.add(emptyIndex);
+        sourceKeys.add(sourceKey);
+      }
+
+      if (newRows.length) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            valueInputOption: "USER_ENTERED",
+            data: newRows.map(({ rowNumber, values }) => ({
+              range: `'${applicationSheetName}'!A${rowNumber}:Z${rowNumber}`,
+              values: [values],
+            })),
+          },
+        });
+      }
+
+      let reminderCount = 0;
+      let passCount = 0;
+      const roundApplications = rows
+        .map((row, index) => applicationFromSheetRow(row || [], index + 11))
+        .filter((application) => application.id && application.roundName === setting.roundName);
+
+      for (const application of roundApplications) {
+        if (!application.reminderSent && setting.reminderChannelId) {
+          try {
+            await sendApplicationReminder(setting, application);
+            const timestamp = sheetDateTime(new Date());
+            await writeApplicationFields(application.rowNumber, {
+              reminder: timestamp,
+              result: "リマインド送信完了",
+            });
+            const row = rows[application.rowNumber - 11];
+            row[21] = timestamp;
+            application.reminderSent = true;
+            reminderCount += 1;
+          } catch (error) {
+            await writeApplicationFields(application.rowNumber, { result: `リマインドエラー: ${error.message}` });
+          }
+        }
+
+        if (application.checks >= setting.threshold && !application.passSent && setting.passChannelId) {
+          try {
+            await sendApplicationPass(setting, application);
+            const timestamp = sheetDateTime(new Date());
+            await writeApplicationFields(application.rowNumber, {
+              pass: timestamp,
+              result: "合格通知送信完了",
+            });
+            const row = rows[application.rowNumber - 11];
+            row[22] = timestamp;
+            application.passSent = true;
+            passCount += 1;
+          } catch (error) {
+            await writeApplicationFields(application.rowNumber, { result: `合格通知エラー: ${error.message}` });
+          }
+        }
+      }
+
+      const channelWait = !setting.reminderChannelId || !setting.passChannelId
+        ? " / Discord通知先待ち"
+        : "";
+      await writeRecruitmentStatus(
+        setting,
+        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 通知${reminderCount}件 / 合格${passCount}件${channelWait}`,
+      );
+    } catch (error) {
+      const message = error.response?.data?.error?.message || error.message || String(error);
+      await writeRecruitmentStatus(setting, `エラー: ${message}`);
+      console.error(`応募フォーム連携失敗: ${setting.roundName}`, message);
+    }
+  }
+}
+
 async function processTerminations() {
   const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
   const completeColumn = terminationSheet.headerMap.get("手続き完了");
@@ -1066,12 +1507,13 @@ client.once("clientReady", () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
   enqueue("起動時全件同期", fullSync);
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
-  setInterval(() => enqueue("シート操作・退職処理", async () => {
+  setInterval(() => enqueue("シート操作・応募・退職処理", async () => {
     await processSheetActions();
     await processBonusDistribution();
+    await processRecruitmentApplications();
     await processTerminations();
   }), actionPollInterval);
-  console.log(`シート操作・退職処理監視: ${actionPollInterval}ms間隔`);
+  console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
 });
 client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
   await syncMember(member);
