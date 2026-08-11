@@ -197,7 +197,7 @@ const legacyActionTriggerHeader = "実行";
 const sortPriorityHeader = "階級順序";
 const bonusFactorHeader = "ランク係数";
 const legacyBonusFactorHeader = "固定係数";
-const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", bonusFactorHeader, "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
+const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", bonusFactorHeader, rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
@@ -275,15 +275,9 @@ function ref(employeeSheet, header, rowNumber) {
 
 function employeeFormulas(employeeSheet, rowNumber) {
   const id = ref(employeeSheet, "社員ID", rowNumber);
-  const discordRoles = ref(employeeSheet, "Discordロール", rowNumber);
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
-  const base = ref(employeeSheet, "基本ボーナス", rowNumber);
-  const adjustment = ref(employeeSheet, "調整額", rowNumber);
   return {
-    "基本ボーナス": `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ボーナス計算機'!$A$16:$A$30,'ボーナス計算機'!$H$16:$H$30),0))`,
     [bonusFactorHeader]: `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
-    "調整額": 0,
-    "見込ボーナス": `=IF(${id}="","",IF(${discordRoles}="解雇者",0,${base}+${adjustment}))`,
   };
 }
 
@@ -564,7 +558,7 @@ async function consolidateEmployeeDuplicates() {
 
   const systemHeaders = new Set([
     "社員ID", "表示名", "Discordロール", "適用ランク",
-    "基本ボーナス", bonusFactorHeader, legacyBonusFactorHeader, "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
+    "基本ボーナス", bonusFactorHeader, legacyBonusFactorHeader, "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
   ]);
   const mergeHeaders = employeeSheet.headers.filter((header) => header && !systemHeaders.has(String(header)));
   const mergeData = [];
@@ -810,12 +804,8 @@ async function processBonusDistribution() {
       throw new Error("新規プール入力に0より大きい金額を入力してください");
     }
 
-    const [employeeResponse, ledgerResponse] = await Promise.all([
-      sheets.spreadsheets.values.get({
-        spreadsheetId,
-        range: "'従業員'!A3:F1000",
-        valueRenderOption: "UNFORMATTED_VALUE",
-      }),
+    const [employeeSheet, ledgerResponse] = await Promise.all([
+      readEmployees(),
       sheets.spreadsheets.values.get({
         spreadsheetId,
         range: `'${bonusDistributionSheetName}'!A12:L1000`,
@@ -823,13 +813,18 @@ async function processBonusDistribution() {
       }),
     ]);
 
-    const employees = (employeeResponse.data.values || [])
+    const employeeIdColumn = employeeSheet.headerMap.get("社員ID");
+    const employeeNameColumn = employeeSheet.headerMap.get("表示名");
+    const employeeRolesColumn = employeeSheet.headerMap.get("Discordロール");
+    const employeeRankColumn = employeeSheet.headerMap.get("適用ランク");
+    const employeeFactorColumn = employeeSheet.headerMap.get(bonusFactorHeader);
+    const employees = employeeSheet.rows
       .map((row) => ({
-        employeeId: String(row[0] || "").trim(),
-        name: String(row[1] || "").trim(),
-        roles: String(row[2] || "").trim(),
-        rank: String(row[3] || "").trim() || "？？？？",
-        factor: Number(row[5]) || 0,
+        employeeId: String(row[employeeIdColumn] || "").trim(),
+        name: String(row[employeeNameColumn] || "").trim(),
+        roles: String(row[employeeRolesColumn] || "").trim(),
+        rank: String(row[employeeRankColumn] || "").trim() || "？？？？",
+        factor: Number(row[employeeFactorColumn]) || 0,
       }))
       .filter((employee) => employee.employeeId && employee.name
         && employee.rank !== "解雇者" && !employee.roles.includes("解雇者"));
