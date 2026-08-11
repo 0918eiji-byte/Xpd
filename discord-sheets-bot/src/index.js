@@ -210,6 +210,8 @@ const recruitmentSettingsSheetName = "募集設定";
 const applicationSheetName = "応募管理";
 const applicationSheetId = 2081134610;
 let displayedApplicationRound = "";
+let lastRecruitmentPollAt = 0;
+const recruitmentPollIntervalMs = Math.max(Number(process.env.RECRUITMENT_POLL_INTERVAL_MS || 60000), 30000);
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -1232,6 +1234,9 @@ async function writeApplicationFields(rowNumber, fields) {
 }
 
 async function processRecruitmentApplications() {
+  const now = Date.now();
+  if (now - lastRecruitmentPollAt < recruitmentPollIntervalMs) return;
+  lastRecruitmentPollAt = now;
   const [topResponse, settings, applicationResponse] = await Promise.all([
     sheets.spreadsheets.values.get({
       spreadsheetId,
@@ -1541,6 +1546,7 @@ client.once("clientReady", () => {
     await processTerminations();
   }), actionPollInterval);
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
+  console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
 });
 client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
   await syncMember(member);
