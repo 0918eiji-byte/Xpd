@@ -943,17 +943,26 @@ async function resolveApplicantDiscordUserId(value) {
   if (!target) return "";
 
   const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
-  const members = await guild.members.fetch();
-  const usernameMatch = members.find((member) => (
-    member.user.username.toLowerCase() === target
-    || member.user.tag.toLowerCase() === target
-  ));
-  if (usernameMatch) return usernameMatch.id;
+  const findMember = (members) => {
+    const usernameMatch = members.find((member) => (
+      member.user.username.toLowerCase() === target
+      || member.user.tag.toLowerCase() === target
+    ));
+    if (usernameMatch) return usernameMatch;
 
-  const displayMatches = members.filter((member) => [member.user.globalName, member.displayName]
-    .filter(Boolean)
-    .some((name) => String(name).trim().toLowerCase() === target));
-  return displayMatches.size === 1 ? displayMatches.first().id : "";
+    const displayMatches = members.filter((member) => [member.user.globalName, member.displayName]
+      .filter(Boolean)
+      .some((name) => String(name).trim().toLowerCase() === target));
+    return displayMatches.size === 1 ? displayMatches.first() : null;
+  };
+
+  // A full member fetch uses Discord's guild-member request gateway and is
+  // rate-limited when several applicants pass in the same sync. Reuse the
+  // member cache populated by startup/previous lookups before requesting it.
+  const cachedMatch = findMember(guild.members.cache);
+  if (cachedMatch) return cachedMatch.id;
+  const members = await guild.members.fetch();
+  return findMember(members)?.id || "";
 }
 
 function recruitmentSettingFromRow(row, index) {
