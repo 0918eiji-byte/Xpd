@@ -934,6 +934,7 @@ function discordNumericId(value) {
 
 function recruitmentSettingFromRow(row, index) {
   const requestedDuration = Number(row[5]);
+  const requestedVoteLimit = Number(row[6]);
   return {
     rowNumber: index + 4,
     enabled: String(row[0] || "").trim() === "はい",
@@ -945,7 +946,10 @@ function recruitmentSettingFromRow(row, index) {
     pollDurationHours: Number.isFinite(requestedDuration) && requestedDuration >= 1 && requestedDuration <= 168
       ? Math.floor(requestedDuration)
       : 24,
-    manualTrigger: isChecked(row[8]),
+    pollVoteLimit: Number.isFinite(requestedVoteLimit) && requestedVoteLimit >= 1 && requestedVoteLimit <= 1000
+      ? Math.floor(requestedVoteLimit)
+      : 5,
+    manualTrigger: isChecked(row[9]),
   };
 }
 
@@ -964,7 +968,7 @@ function sheetCellInputValue(cell) {
 async function readRecruitmentSettings() {
   const response = await sheets.spreadsheets.get({
     spreadsheetId,
-    ranges: [`'${recruitmentSettingsSheetName}'!A4:J100`],
+    ranges: [`'${recruitmentSettingsSheetName}'!A4:K100`],
     includeGridData: true,
     fields: "sheets.data.rowData.values(userEnteredValue,chipRuns)",
   });
@@ -978,7 +982,7 @@ async function readRecruitmentSettings() {
 async function writeRecruitmentStatus(setting, status) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!G${setting.rowNumber}:I${setting.rowNumber}`,
+    range: `'${recruitmentSettingsSheetName}'!H${setting.rowNumber}:J${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1179,7 +1183,8 @@ function pollStateFromMessage(message) {
   const failVotes = answers.find((answer) => answer.text === "不合格")?.voteCount || 0;
   const totalVotes = passVotes + failVotes;
   const expiresTimestamp = poll.expiresTimestamp || 0;
-  const finalized = Boolean(poll.resultsFinalized) || (expiresTimestamp > 0 && expiresTimestamp <= Date.now());
+  const expired = expiresTimestamp > 0 && expiresTimestamp <= Date.now();
+  const finalized = Boolean(poll.resultsFinalized) || expired;
   return {
     pollStatus: finalized ? "FINAL" : "PREVIEW",
     passVotes,
@@ -1190,7 +1195,9 @@ function pollStateFromMessage(message) {
     pollEndsAt: expiresTimestamp ? sheetDateTime(new Date(expiresTimestamp)) : "",
     pollMessageId: message.id,
     pollChannelId: message.channelId,
-    processResult: finalized ? "投票結果を確定" : "投票結果を自動読込中",
+    processResult: finalized
+      ? (expired ? "投票期限に到達して確定" : "投票結果を確定")
+      : "投票結果を自動読込中",
   };
 }
 
@@ -1214,13 +1221,22 @@ async function createApplicationPoll(setting, application) {
   return pollStateFromMessage(message);
 }
 
-async function fetchApplicationPoll(application) {
+async function fetchApplicationPoll(application, setting) {
   const channel = await textChannel(application.pollChannelId, "投票");
   if (!channel.messages || typeof channel.messages.fetch !== "function") {
     throw new Error("投票メッセージを取得できないチャンネルです");
   }
   const message = await channel.messages.fetch(application.pollMessageId);
-  return pollStateFromMessage(message);
+  const state = pollStateFromMessage(message);
+  if (state.pollStatus === "PREVIEW" && state.totalVotes >= setting.pollVoteLimit) {
+    const endedMessage = await message.poll.end();
+    return {
+      ...pollStateFromMessage(endedMessage),
+      pollStatus: "FINAL",
+      processResult: `締切投票数${setting.pollVoteLimit}票に到達して確定`,
+    };
+  }
+  return state;
 }
 
 function applicationPollStateChanged(application, state) {
@@ -1369,7 +1385,7 @@ async function processRecruitmentApplications() {
 
         if (application.pollStatus === "FINAL") continue;
         try {
-          const state = await fetchApplicationPoll(application);
+          const state = await fetchApplicationPoll(application, setting);
           if (!applicationPollStateChanged(application, state)) continue;
           await writeApplicationPollState(application.rowNumber, state);
           Object.assign(application, state);
@@ -1389,7 +1405,7 @@ async function processRecruitmentApplications() {
       const channelWait = !setting.pollChannelId ? " / 投票チャンネル待ち" : "";
       await writeRecruitmentStatus(
         setting,
-        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件${channelWait}`,
+        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件 / 締切${setting.pollDurationHours}時間または${setting.pollVoteLimit}票${channelWait}`,
       );
     } catch (error) {
       const message = error.response?.data?.error?.message || error.message || String(error);
