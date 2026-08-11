@@ -38,7 +38,7 @@ const excludeRoleIds = new Set(
 );
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
 });
 
 let queue = Promise.resolve();
@@ -933,18 +933,19 @@ function discordNumericId(value) {
 }
 
 function recruitmentSettingFromRow(row, index) {
+  const requestedDuration = Number(row[5]);
   return {
     rowNumber: index + 4,
     enabled: String(row[0] || "").trim() === "はい",
     roundName: String(row[1] || "").trim(),
     responseSpreadsheetUrl: String(row[2] || "").trim(),
     responseSheetName: "",
-    reminderChannelId: String(row[3] || "").trim(),
-    reminderMessage: String(row[4] || "").trim() || "新しい応募が届きました。内容を確認してください。",
-    passChannelId: String(row[5] || "").trim(),
-    passMessage: String(row[6] || "").trim() || "合格が決定しました。今後の案内をご確認ください。",
-    threshold: Math.min(Math.max(Number(row[7]) || 3, 1), 5),
-    manualTrigger: isChecked(row[10]),
+    pollChannelId: String(row[3] || "").trim(),
+    pollMessage: String(row[4] || "").trim() || "応募内容を確認し、投票してください。",
+    pollDurationHours: Number.isFinite(requestedDuration) && requestedDuration >= 1 && requestedDuration <= 168
+      ? Math.floor(requestedDuration)
+      : 24,
+    manualTrigger: isChecked(row[8]),
   };
 }
 
@@ -963,7 +964,7 @@ function sheetCellInputValue(cell) {
 async function readRecruitmentSettings() {
   const response = await sheets.spreadsheets.get({
     spreadsheetId,
-    ranges: [`'${recruitmentSettingsSheetName}'!A4:K100`],
+    ranges: [`'${recruitmentSettingsSheetName}'!A4:J100`],
     includeGridData: true,
     fields: "sheets.data.rowData.values(userEnteredValue,chipRuns)",
   });
@@ -977,7 +978,7 @@ async function readRecruitmentSettings() {
 async function writeRecruitmentStatus(setting, status) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!I${setting.rowNumber}:K${setting.rowNumber}`,
+    range: `'${recruitmentSettingsSheetName}'!G${setting.rowNumber}:I${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1077,16 +1078,16 @@ function applicationSheetRow(rowNumber, setting, application, sourceKey) {
     application.ideal,
     application.whitelist,
     application.question,
-    false,
-    false,
-    false,
-    false,
-    false,
-    `=COUNTIF(O${rowNumber}:S${rowNumber},TRUE)`,
-    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$H$4:$H$100),3),"合格","審査中"))`,
+    "PENDING",
+    0,
+    0,
+    0,
+    "投票待ち",
     "",
     "",
-    "取込完了",
+    "",
+    "",
+    "取込完了・投票作成待ち",
     setting.roundName,
     sourceKey,
   ];
@@ -1109,9 +1110,16 @@ function applicationFromSheetRow(row, rowNumber) {
     ideal: String(row[11] || "").trim(),
     whitelist: String(row[12] || "").trim(),
     question: String(row[13] || "").trim(),
-    checks: row.slice(14, 19).filter(isChecked).length,
-    reminderSent: Boolean(row[21]),
-    passSent: Boolean(row[22]),
+    pollStatus: String(row[14] || "").trim(),
+    passVotes: Number(row[15]) || 0,
+    failVotes: Number(row[16]) || 0,
+    totalVotes: Number(row[17]) || 0,
+    verdict: String(row[18] || "").trim(),
+    pollUrl: String(row[19] || "").trim(),
+    pollEndsAt: row[20] || "",
+    pollMessageId: String(row[21] || "").replace(/^'/, "").trim(),
+    pollChannelId: String(row[22] || "").replace(/^'/, "").trim(),
+    processResult: String(row[23] || "").trim(),
     roundName: String(row[24] || "").trim(),
   };
 }
@@ -1158,72 +1166,92 @@ async function textChannel(channelId, label) {
   return channel;
 }
 
-function normalizeDiscordUsername(value) {
-  return String(value || "").replace(/^'/, "").replace(/^@/, "").trim().toLowerCase();
+function pollVerdict(passVotes, totalVotes) {
+  if (totalVotes <= 0) return "投票待ち";
+  return passVotes * 2 >= totalVotes ? "合格" : "不合格";
 }
 
-async function resolveApplicantDiscordUserId(value) {
-  const numericId = discordNumericId(value);
-  if (numericId) return numericId;
-  const target = normalizeDiscordUsername(value);
-  if (!target) return "";
-
-  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
-  const members = await guild.members.fetch();
-  const usernameMatch = members.find((member) => (
-    member.user.username.toLowerCase() === target
-    || member.user.tag.toLowerCase() === target
-  ));
-  if (usernameMatch) return usernameMatch.id;
-
-  const displayMatches = members.filter((member) => [member.user.globalName, member.displayName]
-    .filter(Boolean)
-    .some((name) => String(name).trim().toLowerCase() === target));
-  return displayMatches.size === 1 ? displayMatches.first().id : "";
-}
-
-async function notificationMentions(application, message) {
-  const userId = await resolveApplicantDiscordUserId(application.discordId);
-  const description = String(message || "").trim();
+function pollStateFromMessage(message) {
+  const poll = message.poll;
+  if (!poll) throw new Error("Discordメッセージに投票データがありません");
+  const answers = [...poll.answers.values()];
+  const passVotes = answers.find((answer) => answer.text === "合格")?.voteCount || 0;
+  const failVotes = answers.find((answer) => answer.text === "不合格")?.voteCount || 0;
+  const totalVotes = passVotes + failVotes;
+  const expiresTimestamp = poll.expiresTimestamp || 0;
+  const finalized = Boolean(poll.resultsFinalized) || (expiresTimestamp > 0 && expiresTimestamp <= Date.now());
   return {
-    content: [description, userId ? `<@${userId}>` : ""].filter(Boolean).join("\n") || undefined,
-    allowedMentions: {
-      users: userId ? [userId] : [],
-    },
-    applicantMatched: Boolean(userId),
-    userId,
+    pollStatus: finalized ? "FINAL" : "PREVIEW",
+    passVotes,
+    failVotes,
+    totalVotes,
+    verdict: pollVerdict(passVotes, totalVotes),
+    pollUrl: message.url,
+    pollEndsAt: expiresTimestamp ? sheetDateTime(new Date(expiresTimestamp)) : "",
+    pollMessageId: message.id,
+    pollChannelId: message.channelId,
+    processResult: finalized ? "投票結果を確定" : "投票結果を自動読込中",
   };
 }
 
-async function sendApplicationReminder(setting, application) {
-  const channel = await textChannel(setting.reminderChannelId, "リマインド");
-  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(application, setting.reminderMessage);
-  await channel.send({
-    ...mentions,
-    embeds: [applicationEmbed(application, `${setting.roundName} 新規応募リマインド`, 0x2563eb)],
+async function createApplicationPoll(setting, application) {
+  const channel = await textChannel(setting.pollChannelId, "投票");
+  const subject = truncateDiscord(application.name || application.discordId || application.id, 220);
+  const message = await channel.send({
+    content: setting.pollMessage,
+    embeds: [applicationEmbed(application, `${setting.roundName} 応募審査`, 0x2563eb)],
+    poll: {
+      question: { text: `${subject} を合格としますか？` },
+      answers: [
+        { text: "合格", emoji: "✅" },
+        { text: "不合格", emoji: "❌" },
+      ],
+      allowMultiselect: false,
+      duration: setting.pollDurationHours,
+    },
+    allowedMentions: { parse: [] },
   });
-  return applicantMatched;
+  return pollStateFromMessage(message);
 }
 
-async function sendApplicationPass(setting, application) {
-  const channel = await textChannel(setting.passChannelId, "合格通知");
-  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(application, setting.passMessage);
-  const embed = applicationEmbed(application, `${setting.roundName} 合格判定`, 0x16a34a)
-    .setDescription(`審査チェック ${application.checks}/${setting.threshold} に到達しました。`);
-  await channel.send({ ...mentions, embeds: [embed] });
-  return applicantMatched;
+async function fetchApplicationPoll(application) {
+  const channel = await textChannel(application.pollChannelId, "投票");
+  if (!channel.messages || typeof channel.messages.fetch !== "function") {
+    throw new Error("投票メッセージを取得できないチャンネルです");
+  }
+  const message = await channel.messages.fetch(application.pollMessageId);
+  return pollStateFromMessage(message);
 }
 
-async function writeApplicationFields(rowNumber, fields) {
-  const columns = { reminder: "V", pass: "W", result: "X" };
-  await sheets.spreadsheets.values.batchUpdate({
+function applicationPollStateChanged(application, state) {
+  return application.pollStatus !== state.pollStatus
+    || application.passVotes !== state.passVotes
+    || application.failVotes !== state.failVotes
+    || application.totalVotes !== state.totalVotes
+    || application.verdict !== state.verdict
+    || application.pollUrl !== state.pollUrl
+    || application.pollMessageId !== state.pollMessageId
+    || application.pollChannelId !== state.pollChannelId;
+}
+
+async function writeApplicationPollState(rowNumber, state) {
+  await sheets.spreadsheets.values.update({
     spreadsheetId,
+    range: `'${applicationSheetName}'!O${rowNumber}:X${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
     requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: Object.entries(fields).map(([key, value]) => ({
-        range: `'${applicationSheetName}'!${columns[key]}${rowNumber}`,
-        values: [[value]],
-      })),
+      values: [[
+        state.pollStatus,
+        state.passVotes,
+        state.failVotes,
+        state.totalVotes,
+        state.verdict,
+        state.pollUrl,
+        state.pollEndsAt,
+        discordIdCell(state.pollMessageId),
+        discordIdCell(state.pollChannelId),
+        state.processResult,
+      ]],
     },
   });
 }
@@ -1260,11 +1288,8 @@ async function processRecruitmentApplications() {
         await writeRecruitmentStatus(setting, "回答スプレッドシートURL待ち");
         continue;
       }
-      if (setting.reminderChannelId && !/^\d{17,20}$/.test(setting.reminderChannelId)) {
-        throw new Error("リマインドチャンネルIDの形式が正しくありません");
-      }
-      if (setting.passChannelId && !/^\d{17,20}$/.test(setting.passChannelId)) {
-        throw new Error("合格通知チャンネルIDの形式が正しくありません");
+      if (setting.pollChannelId && !/^\d{17,20}$/.test(setting.pollChannelId)) {
+        throw new Error("投票チャンネルIDの形式が正しくありません");
       }
       const responseSheetName = await resolveResponseSheetName(responseSpreadsheetId, setting.responseSheetName);
       const formResponse = await sheets.spreadsheets.values.get({
@@ -1313,54 +1338,58 @@ async function processRecruitmentApplications() {
         });
       }
 
-      let reminderCount = 0;
-      let passCount = 0;
+      let pollCreatedCount = 0;
+      let pollUpdatedCount = 0;
       const roundApplications = rows
         .map((row, index) => applicationFromSheetRow(row || [], index + 11))
         .filter((application) => application.id && application.roundName === setting.roundName);
 
       for (const application of roundApplications) {
-        if (!application.reminderSent && setting.reminderChannelId) {
+        if (!application.pollMessageId) {
+          if (!setting.pollChannelId) continue;
           try {
-            const applicantMatched = await sendApplicationReminder(setting, application);
-            const timestamp = sheetDateTime(new Date());
-            await writeApplicationFields(application.rowNumber, {
-              reminder: timestamp,
-              result: applicantMatched ? "リマインド送信完了" : "リマインド送信完了（本人メンション未解決）",
-            });
+            const state = await createApplicationPoll(setting, application);
+            await writeApplicationPollState(application.rowNumber, state);
             const row = rows[application.rowNumber - 11];
-            row[21] = timestamp;
-            application.reminderSent = true;
-            reminderCount += 1;
+            row.splice(14, 10,
+              state.pollStatus, state.passVotes, state.failVotes, state.totalVotes, state.verdict,
+              state.pollUrl, state.pollEndsAt, state.pollMessageId, state.pollChannelId, state.processResult);
+            Object.assign(application, state);
+            pollCreatedCount += 1;
           } catch (error) {
-            await writeApplicationFields(application.rowNumber, { result: `リマインドエラー: ${error.message}` });
+            await sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range: `'${applicationSheetName}'!X${application.rowNumber}`,
+              valueInputOption: "RAW",
+              requestBody: { values: [[`投票作成エラー: ${error.message}`]] },
+            });
           }
+          continue;
         }
 
-        if (application.checks >= setting.threshold && !application.passSent && setting.passChannelId) {
-          try {
-            const applicantMatched = await sendApplicationPass(setting, application);
-            const timestamp = sheetDateTime(new Date());
-            await writeApplicationFields(application.rowNumber, {
-              pass: timestamp,
-              result: applicantMatched ? "合格通知送信完了" : "合格通知送信完了（本人メンション未解決）",
-            });
-            const row = rows[application.rowNumber - 11];
-            row[22] = timestamp;
-            application.passSent = true;
-            passCount += 1;
-          } catch (error) {
-            await writeApplicationFields(application.rowNumber, { result: `合格通知エラー: ${error.message}` });
-          }
+        if (application.pollStatus === "FINAL") continue;
+        try {
+          const state = await fetchApplicationPoll(application);
+          if (!applicationPollStateChanged(application, state)) continue;
+          await writeApplicationPollState(application.rowNumber, state);
+          Object.assign(application, state);
+          pollUpdatedCount += 1;
+        } catch (error) {
+          await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `'${applicationSheetName}'!X${application.rowNumber}`,
+            valueInputOption: "RAW",
+            requestBody: { values: [[`投票読込エラー: ${error.message}`]] },
+          });
         }
       }
 
-      const channelWait = !setting.reminderChannelId || !setting.passChannelId
-        ? " / Discord通知先待ち"
-        : "";
+      const previewCount = roundApplications.filter((application) => application.pollStatus === "PREVIEW").length;
+      const finalCount = roundApplications.filter((application) => application.pollStatus === "FINAL").length;
+      const channelWait = !setting.pollChannelId ? " / 投票チャンネル待ち" : "";
       await writeRecruitmentStatus(
         setting,
-        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 通知${reminderCount}件 / 合格${passCount}件${channelWait}`,
+        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件${channelWait}`,
       );
     } catch (error) {
       const message = error.response?.data?.error?.message || error.message || String(error);
