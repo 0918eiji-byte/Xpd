@@ -139,7 +139,9 @@ async function applySelectedRank(guild, member, rankMap, requestedRank, reason) 
 
   const targetRole = target ? guild.roles.cache.get(target.roleId) : null;
   if (target && !targetRole) throw new Error(`対象ロールが見つかりません: ${target.rankName}`);
-  if (targetRole && !targetRole.editable) throw new Error(`Botより上位のロールは操作できません: ${targetRole.name}`);
+  if (targetRole && !member.roles.cache.has(target.roleId) && !targetRole.editable) {
+    throw new Error(`Botより上位のロールは操作できません: ${targetRole.name}`);
+  }
   const removeIds = currentRanks.filter((rank) => rank.roleId !== target?.roleId).map((rank) => rank.roleId);
   const blocked = removeIds
     .map((roleId) => guild.roles.cache.get(roleId))
