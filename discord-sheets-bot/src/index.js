@@ -202,6 +202,10 @@ const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "�
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
 const retentionPeriodMs = 7 * 24 * 60 * 60 * 1000;
+const bonusDistributionSheetName = "ボーナス配布";
+const bonusDistributionSheetId = 1863429017;
+const bonusRoundSettingsSheetName = "ボーナス回設定";
+let displayedBonusRound = "";
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -701,6 +705,203 @@ async function processSheetActions() {
   if (needsSort) await sortEmployees(await readEmployees());
 }
 
+async function applyBonusRoundFilter(roundName) {
+  if (!roundName || displayedBonusRound === roundName) return;
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        setBasicFilter: {
+          filter: {
+            range: {
+              sheetId: bonusDistributionSheetId,
+              startRowIndex: 10,
+              endRowIndex: 1000,
+              startColumnIndex: 0,
+              endColumnIndex: 12,
+            },
+            criteria: {
+              11: {
+                condition: {
+                  type: "TEXT_EQ",
+                  values: [{ userEnteredValue: roundName }],
+                },
+              },
+            },
+          },
+        },
+      }],
+    },
+  });
+  displayedBonusRound = roundName;
+}
+
+async function writeBonusTop(data) {
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: Object.entries(data).map(([cell, value]) => ({
+        range: `'${bonusDistributionSheetName}'!${cell}`,
+        values: [[value]],
+      })),
+    },
+  });
+}
+
+async function saveBonusRoundSetting(roundName, poolAmount, loadedAt) {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${bonusRoundSettingsSheetName}'!A2:C100`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const rows = response.data.values || [];
+  let index = rows.findIndex((row) => String(row[0] || "").trim() === roundName);
+  if (index < 0) index = rows.findIndex((row) => !String(row[0] || "").trim());
+  if (index < 0) index = rows.length;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${bonusRoundSettingsSheetName}'!A${index + 2}:C${index + 2}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[roundName, poolAmount, sheetDateTime(loadedAt)]] },
+  });
+}
+
+function bonusLedgerRow(rowNumber, roundName, employee, loadedAt, existingRow = null) {
+  const basicPay = `=IF(B${rowNumber}="","",IF(SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000)=0,0,ROUNDDOWN(IFNA(XLOOKUP($L${rowNumber},'${bonusRoundSettingsSheetName}'!$A$2:$A$100,'${bonusRoundSettingsSheetName}'!$B$2:$B$100),0)*E${rowNumber}/SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000),-7)))`;
+  return [
+    sheetDateTime(loadedAt).slice(0, 10),
+    employee.employeeId,
+    employee.name,
+    employee.rank,
+    employee.factor,
+    basicPay,
+    Number(existingRow?.[6]) || 0,
+    `=IF(B${rowNumber}="","",F${rowNumber}+G${rowNumber})`,
+    String(existingRow?.[8] || "").trim(),
+    isChecked(existingRow?.[9]),
+    isChecked(existingRow?.[10]),
+    roundName,
+  ];
+}
+
+async function processBonusDistribution() {
+  const topResponse = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${bonusDistributionSheetName}'!A4:R4`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const top = topResponse.data.values?.[0] || [];
+  const roundName = String(top[1] || "").trim();
+  if (roundName) await applyBonusRoundFilter(roundName);
+  if (!isChecked(top[10])) return;
+
+  try {
+    await writeBonusTop({ N4: "処理中: 従業員を読込中" });
+    if (!roundName) throw new Error("表示回を選択してください");
+    const poolAmount = Number(top[7]);
+    if (!Number.isFinite(poolAmount) || poolAmount <= 0) {
+      throw new Error("新規プール入力に0より大きい金額を入力してください");
+    }
+
+    const [employeeResponse, ledgerResponse] = await Promise.all([
+      sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: "'従業員'!A3:F1000",
+        valueRenderOption: "UNFORMATTED_VALUE",
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `'${bonusDistributionSheetName}'!A12:L1000`,
+        valueRenderOption: "UNFORMATTED_VALUE",
+      }),
+    ]);
+
+    const employees = (employeeResponse.data.values || [])
+      .map((row) => ({
+        employeeId: String(row[0] || "").trim(),
+        name: String(row[1] || "").trim(),
+        roles: String(row[2] || "").trim(),
+        rank: String(row[3] || "").trim() || "？？？？",
+        factor: Number(row[5]) || 0,
+      }))
+      .filter((employee) => employee.employeeId && employee.name
+        && employee.rank !== "解雇者" && !employee.roles.includes("解雇者"));
+    if (!employees.length) throw new Error("従業員ページに読込対象がいません");
+
+    const ledgerRows = ledgerResponse.data.values || [];
+    const oldRoundRows = [];
+    const emptyRows = [];
+    const existingByEmployeeId = new Map();
+    for (let index = 0; index < 989; index += 1) {
+      const row = ledgerRows[index] || [];
+      const rowNumber = index + 12;
+      const rowRound = String(row[11] || "").trim();
+      if (rowRound === roundName) {
+        oldRoundRows.push(rowNumber);
+        const existingEmployeeId = String(row[1] || "").trim();
+        if (existingEmployeeId && !existingByEmployeeId.has(existingEmployeeId)) {
+          existingByEmployeeId.set(existingEmployeeId, { rowNumber, row });
+        }
+      }
+      else if (!String(row[1] || "").trim() && !rowRound) emptyRows.push(rowNumber);
+    }
+    const availableRows = [...oldRoundRows, ...emptyRows];
+    const usedRows = new Set();
+    const assignments = employees.map((employee) => {
+      const existing = existingByEmployeeId.get(employee.employeeId);
+      if (existing && !usedRows.has(existing.rowNumber)) {
+        usedRows.add(existing.rowNumber);
+        return { employee, rowNumber: existing.rowNumber, existingRow: existing.row };
+      }
+      const rowNumber = availableRows.find((candidate) => !usedRows.has(candidate));
+      if (!rowNumber) return null;
+      usedRows.add(rowNumber);
+      return { employee, rowNumber, existingRow: null };
+    });
+    if (assignments.some((assignment) => !assignment)) {
+      throw new Error("ボーナス配布の保存行が不足しています");
+    }
+
+    const loadedAt = new Date();
+    await saveBonusRoundSetting(roundName, poolAmount, loadedAt);
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: assignments.map(({ employee, rowNumber, existingRow }) => {
+          return {
+            range: `'${bonusDistributionSheetName}'!A${rowNumber}:L${rowNumber}`,
+            values: [bonusLedgerRow(rowNumber, roundName, employee, loadedAt, existingRow)],
+          };
+        }),
+      },
+    });
+
+    const unusedOldRows = oldRoundRows.filter((rowNumber) => !usedRows.has(rowNumber));
+    if (unusedOldRows.length) {
+      await sheets.spreadsheets.values.batchClear({
+        spreadsheetId,
+        requestBody: {
+          ranges: unusedOldRows.map((rowNumber) => `'${bonusDistributionSheetName}'!A${rowNumber}:L${rowNumber}`),
+        },
+      });
+    }
+    displayedBonusRound = "";
+    await applyBonusRoundFilter(roundName);
+    await writeBonusTop({
+      H4: "",
+      K4: false,
+      N4: `完了: ${employees.length}名を${roundName}へ読込`,
+    });
+    console.log(`ボーナス配布読込完了: ${roundName} ${employees.length}名 プール=${poolAmount}`);
+  } catch (error) {
+    const message = error.response?.data?.error?.message || error.message || String(error);
+    await writeBonusTop({ K4: false, N4: `エラー: ${message}` });
+    console.error("ボーナス配布読込失敗:", message);
+  }
+}
+
 async function processTerminations() {
   const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
   const completeColumn = terminationSheet.headerMap.get("手続き完了");
@@ -867,6 +1068,7 @@ client.once("clientReady", () => {
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
   setInterval(() => enqueue("シート操作・退職処理", async () => {
     await processSheetActions();
+    await processBonusDistribution();
     await processTerminations();
   }), actionPollInterval);
   console.log(`シート操作・退職処理監視: ${actionPollInterval}ms間隔`);
