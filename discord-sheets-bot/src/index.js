@@ -940,22 +940,20 @@ function recruitmentSettingFromRow(row, index) {
     rowNumber: index + 4,
     enabled: String(row[0] || "").trim() === "はい",
     roundName: String(row[1] || "").trim(),
-    publicFormUrl: String(row[2] || "").trim(),
-    responseSpreadsheetUrl: String(row[3] || "").trim(),
-    responseSheetName: String(row[4] || "").trim(),
-    reminderChannelId: String(row[5] || "").trim(),
-    passChannelId: String(row[6] || "").trim(),
-    mentionRoleId: String(row[7] || "").trim(),
-    threshold: Math.min(Math.max(Number(row[8]) || 3, 1), 5),
-    passRoleId: String(row[9] || "").trim(),
-    manualTrigger: isChecked(row[12]),
+    responseSpreadsheetUrl: String(row[2] || "").trim(),
+    responseSheetName: "",
+    reminderChannelId: String(row[3] || "").trim(),
+    passChannelId: String(row[4] || "").trim(),
+    mentionRoleId: String(row[5] || "").trim(),
+    threshold: Math.min(Math.max(Number(row[6]) || 3, 1), 5),
+    manualTrigger: isChecked(row[9]),
   };
 }
 
 async function readRecruitmentSettings() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!A4:M100`,
+    range: `'${recruitmentSettingsSheetName}'!A4:J100`,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
   return (response.data.values || []).map(recruitmentSettingFromRow).filter((setting) => setting.roundName);
@@ -964,7 +962,7 @@ async function readRecruitmentSettings() {
 async function writeRecruitmentStatus(setting, status) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!K${setting.rowNumber}:M${setting.rowNumber}`,
+    range: `'${recruitmentSettingsSheetName}'!H${setting.rowNumber}:J${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1022,7 +1020,7 @@ function quoteSheetName(sheetName) {
 function responseApplication(headers, row) {
   return {
     submittedAt: formValue(headers, row, ["タイムスタンプ", "timestamp"], 0),
-    discordId: String(formValue(headers, row, ["Discord ID", "DiscordユーザーID"])).replace(/^'/, "").trim(),
+    discordId: String(formValue(headers, row, ["Discord ID", "DiscordユーザーID", "Discordユーザー名", "Discord username"])).replace(/^'/, "").trim(),
     name: String(formValue(headers, row, ["街での名前", "名前"])).trim(),
     age: String(formValue(headers, row, ["年齢"])).trim(),
     department: String(formValue(headers, row, ["希望の部署", "希望部署"])).trim(),
@@ -1049,11 +1047,10 @@ function applicationId(roundName, sourceKey) {
 }
 
 function applicationSheetRow(rowNumber, setting, application, sourceKey) {
-  const discordId = discordNumericId(application.discordId);
   return [
     applicationId(setting.roundName, sourceKey),
     application.submittedAt,
-    discordId ? `'${discordId}` : application.discordId,
+    application.discordId,
     application.name,
     application.age,
     application.department,
@@ -1071,7 +1068,7 @@ function applicationSheetRow(rowNumber, setting, application, sourceKey) {
     false,
     false,
     `=COUNTIF(O${rowNumber}:S${rowNumber},TRUE)`,
-    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$I$4:$I$100),3),"合格","審査中"))`,
+    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$G$4:$G$100),3),"合格","審査中"))`,
     "",
     "",
     "取込完了",
@@ -1120,7 +1117,7 @@ function applicationEmbed(application, title, color) {
     .setURL(applicationLink(application.rowNumber))
     .addFields(
       { name: "応募ID", value: truncateDiscord(application.id, 100), inline: true },
-      { name: "Discord ID", value: truncateDiscord(application.discordId, 100), inline: true },
+      { name: "Discordユーザー名", value: truncateDiscord(application.discordId, 100), inline: true },
       { name: "街での名前", value: truncateDiscord(application.name, 100), inline: true },
       { name: "年齢", value: truncateDiscord(application.age, 100), inline: true },
       { name: "希望部署", value: truncateDiscord(application.department, 100), inline: true },
@@ -1146,48 +1143,61 @@ async function textChannel(channelId, label) {
   return channel;
 }
 
-function notificationMentions(setting, application) {
-  const userId = discordNumericId(application.discordId);
+function normalizeDiscordUsername(value) {
+  return String(value || "").replace(/^'/, "").replace(/^@/, "").trim().toLowerCase();
+}
+
+async function resolveApplicantDiscordUserId(value) {
+  const numericId = discordNumericId(value);
+  if (numericId) return numericId;
+  const target = normalizeDiscordUsername(value);
+  if (!target) return "";
+
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+  const members = await guild.members.fetch();
+  const usernameMatch = members.find((member) => (
+    member.user.username.toLowerCase() === target
+    || member.user.tag.toLowerCase() === target
+  ));
+  if (usernameMatch) return usernameMatch.id;
+
+  const displayMatches = members.filter((member) => [member.user.globalName, member.displayName]
+    .filter(Boolean)
+    .some((name) => String(name).trim().toLowerCase() === target));
+  return displayMatches.size === 1 ? displayMatches.first().id : "";
+}
+
+async function notificationMentions(setting, application) {
+  const userId = await resolveApplicantDiscordUserId(application.discordId);
   const roleId = /^\d{17,20}$/.test(setting.mentionRoleId) ? setting.mentionRoleId : "";
   return {
-    content: [roleId ? `<@&${roleId}>` : "", userId ? `<@${userId}>` : ""].filter(Boolean).join(" "),
+    content: [roleId ? `<@&${roleId}>` : "", userId ? `<@${userId}>` : ""].filter(Boolean).join(" ") || undefined,
     allowedMentions: {
       roles: roleId ? [roleId] : [],
       users: userId ? [userId] : [],
     },
+    applicantMatched: Boolean(userId),
+    userId,
   };
 }
 
 async function sendApplicationReminder(setting, application) {
   const channel = await textChannel(setting.reminderChannelId, "リマインド");
-  const mentions = notificationMentions(setting, application);
+  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(setting, application);
   await channel.send({
     ...mentions,
     embeds: [applicationEmbed(application, `${setting.roundName} 新規応募リマインド`, 0x2563eb)],
   });
+  return applicantMatched;
 }
 
 async function sendApplicationPass(setting, application) {
-  let roleResult = "";
-  const userId = discordNumericId(application.discordId);
-  if (userId && /^\d{17,20}$/.test(setting.passRoleId)) {
-    try {
-      const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
-      const member = guild.members.cache.get(userId) || await guild.members.fetch(userId);
-      const role = guild.roles.cache.get(setting.passRoleId) || await guild.roles.fetch(setting.passRoleId);
-      if (!role) throw new Error("付与ロールが見つかりません");
-      if (!role.editable) throw new Error("Botより上位のロールは付与できません");
-      if (!member.roles.cache.has(role.id)) await member.roles.add(role.id, `${setting.roundName}応募の合格判定`);
-      roleResult = `\n付与ロール: ${role.name}`;
-    } catch (error) {
-      roleResult = `\nロール付与のみ失敗: ${error.message}`;
-    }
-  }
   const channel = await textChannel(setting.passChannelId, "合格通知");
-  const mentions = notificationMentions(setting, application);
+  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(setting, application);
   const embed = applicationEmbed(application, `${setting.roundName} 合格判定`, 0x16a34a)
-    .setDescription(`審査チェック ${application.checks}/${setting.threshold} に到達しました。${roleResult}`);
+    .setDescription(`審査チェック ${application.checks}/${setting.threshold} に到達しました。`);
   await channel.send({ ...mentions, embeds: [embed] });
+  return applicantMatched;
 }
 
 async function writeApplicationFields(rowNumber, fields) {
@@ -1226,7 +1236,7 @@ async function processRecruitmentApplications() {
   const occupiedRows = new Set(rows.map((row, index) => String(row[0] || "").trim() ? index : -1).filter((index) => index >= 0));
 
   for (const setting of settings) {
-    if (!setting.enabled) continue;
+    if (!setting.enabled && !setting.manualTrigger) continue;
     try {
       const responseSpreadsheetId = extractSpreadsheetId(setting.responseSpreadsheetUrl);
       if (!responseSpreadsheetId) {
@@ -1295,11 +1305,11 @@ async function processRecruitmentApplications() {
       for (const application of roundApplications) {
         if (!application.reminderSent && setting.reminderChannelId) {
           try {
-            await sendApplicationReminder(setting, application);
+            const applicantMatched = await sendApplicationReminder(setting, application);
             const timestamp = sheetDateTime(new Date());
             await writeApplicationFields(application.rowNumber, {
               reminder: timestamp,
-              result: "リマインド送信完了",
+              result: applicantMatched ? "リマインド送信完了" : "リマインド送信完了（本人メンション未解決）",
             });
             const row = rows[application.rowNumber - 11];
             row[21] = timestamp;
@@ -1312,11 +1322,11 @@ async function processRecruitmentApplications() {
 
         if (application.checks >= setting.threshold && !application.passSent && setting.passChannelId) {
           try {
-            await sendApplicationPass(setting, application);
+            const applicantMatched = await sendApplicationPass(setting, application);
             const timestamp = sheetDateTime(new Date());
             await writeApplicationFields(application.rowNumber, {
               pass: timestamp,
-              result: "合格通知送信完了",
+              result: applicantMatched ? "合格通知送信完了" : "合格通知送信完了（本人メンション未解決）",
             });
             const row = rows[application.rowNumber - 11];
             row[22] = timestamp;
