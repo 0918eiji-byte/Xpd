@@ -1212,12 +1212,16 @@ function pollVerdict(passVotes, totalVotes) {
   return passVotes * 2 >= totalVotes ? "合格" : "不合格";
 }
 
-function pollStateFromMessage(message) {
+function pollStateFromMessage(message, fetchedVotes = null) {
   const poll = message.poll;
   if (!poll) throw new Error("Discordメッセージに投票データがありません");
   const answers = [...poll.answers.values()];
-  const passVotes = answers.find((answer) => answer.text === "合格")?.voteCount || 0;
-  const failVotes = answers.find((answer) => answer.text === "不合格")?.voteCount || 0;
+  const passVotes = fetchedVotes?.passVotes
+    ?? answers.find((answer) => answer.text === "合格")?.voteCount
+    ?? 0;
+  const failVotes = fetchedVotes?.failVotes
+    ?? answers.find((answer) => answer.text === "不合格")?.voteCount
+    ?? 0;
   const totalVotes = passVotes + failVotes;
   const expiresTimestamp = poll.expiresTimestamp || 0;
   const expired = expiresTimestamp > 0 && expiresTimestamp <= Date.now();
@@ -1236,6 +1240,33 @@ function pollStateFromMessage(message) {
       ? (expired ? "投票期限に到達して確定" : "投票結果を確定")
       : "投票結果を自動読込中",
   };
+}
+
+async function countPollAnswerVoters(answer) {
+  if (!answer) return 0;
+  let total = 0;
+  let after = "";
+  while (true) {
+    const voters = await answer.fetchVoters({
+      limit: 100,
+      ...(after ? { after } : {}),
+    });
+    total += voters.size;
+    const lastId = voters.lastKey();
+    if (voters.size < 100 || !lastId || lastId === after) return total;
+    after = lastId;
+  }
+}
+
+async function fetchPollVoteCounts(message) {
+  const answers = [...message.poll.answers.values()];
+  const passAnswer = answers.find((answer) => answer.text === "合格");
+  const failAnswer = answers.find((answer) => answer.text === "不合格");
+  const [passVotes, failVotes] = await Promise.all([
+    countPollAnswerVoters(passAnswer),
+    countPollAnswerVoters(failAnswer),
+  ]);
+  return { passVotes, failVotes };
 }
 
 async function createApplicationPoll(setting, application) {
@@ -1270,11 +1301,12 @@ async function fetchApplicationPoll(application, setting) {
     message: application.pollMessageId,
     force: true,
   });
-  const state = pollStateFromMessage(message);
+  const fetchedVotes = await fetchPollVoteCounts(message);
+  const state = pollStateFromMessage(message, fetchedVotes);
   if (state.pollStatus === "PREVIEW" && state.totalVotes >= setting.pollVoteLimit) {
     const endedMessage = await message.poll.end();
     return {
-      ...pollStateFromMessage(endedMessage),
+      ...pollStateFromMessage(endedMessage, fetchedVotes),
       pollStatus: "FINAL",
       processResult: `締切投票数${setting.pollVoteLimit}票に到達して確定`,
     };
