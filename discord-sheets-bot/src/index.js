@@ -578,6 +578,11 @@ async function processSheetActions() {
         continue;
       }
 
+      if (discordRank === "解雇") {
+        lastSynchronizedRanks.set(discordId, discordRank);
+        continue;
+      }
+
       const sheetRank = String(row[appliedRankColumn] || "").trim();
       if (!sheetRank || sheetRank === discordRank) {
         lastSynchronizedRanks.set(discordId, discordRank);
@@ -754,7 +759,7 @@ async function markRemoved(member) {
 client.once("clientReady", () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
   enqueue("起動時全件同期", fullSync);
-  const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 5000), 3000);
+  const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
   setInterval(() => enqueue("シート操作・退職処理", async () => {
     await processSheetActions();
     await processTerminations();
