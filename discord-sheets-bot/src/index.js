@@ -103,6 +103,18 @@ async function ensureRosterRole(guild, member, reason) {
   return true;
 }
 
+async function removeRosterRoles(guild, member, reason) {
+  const roleIds = [...rosterRoleIds].filter((roleId) => member.roles.cache.has(roleId));
+  if (!roleIds.length) return [];
+  const roles = roleIds.map((roleId) => guild.roles.cache.get(roleId)).filter(Boolean);
+  const missingIds = roleIds.filter((roleId) => !guild.roles.cache.has(roleId));
+  if (missingIds.length) throw new Error(`Police Officerロールが見つかりません: ${missingIds.join(", ")}`);
+  const blocked = roles.filter((role) => !role.editable).map((role) => role.name);
+  if (blocked.length) throw new Error(`Botより上位のロールは解除できません: ${blocked.join(", ")}`);
+  await member.roles.remove(roleIds, reason);
+  return roles.map((role) => role.name);
+}
+
 async function applySelectedRank(guild, member, rankMap, requestedRank, reason) {
   const selected = String(requestedRank || "").trim();
   const ranks = sortedRanks(rankMap);
@@ -389,6 +401,15 @@ async function syncMember(member, context = null) {
   }
 
   if (hasDismissedRole) {
+    if (hasRosterRole) {
+      const removedRoles = await removeRosterRoles(
+        member.guild,
+        member,
+        "退職者ロールを検知したため名簿対象ロールを自動解除",
+      );
+      hasRosterRole = false;
+      console.log(`退職者の名簿対象ロールを自動解除: ${member.displayName} (${removedRoles.join(", ")})`);
+    }
     const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
     const previousRank = assessed.rankName || (index >= 0
       ? String(employeeSheet.rows[index][appliedRankColumn] || "").trim()
