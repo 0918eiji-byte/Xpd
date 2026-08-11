@@ -76,6 +76,7 @@ function assessMember(member, rankMap) {
   return {
     roleNames: [...new Set(matches.map((item) => item.roleName))].join(", "),
     rankName: matches[0]?.rankName || "",
+    priority: matches[0]?.priority ?? 9999,
   };
 }
 
@@ -181,7 +182,8 @@ function columnLetter(index) {
 const rankSelectionHeader = "変更後ランク";
 const actionTriggerHeader = "実行ボタン";
 const legacyActionTriggerHeader = "実行";
-const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時"];
+const sortPriorityHeader = "階級順序";
+const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
@@ -345,21 +347,43 @@ async function applyEmployeeUpdates(data, context) {
 }
 
 async function sortEmployees(employeeSheet) {
+  const priorityColumn = employeeSheet.headerMap.get(sortPriorityHeader);
+  const nameColumn = employeeSheet.headerMap.get("表示名");
+  if (priorityColumn === undefined || nameColumn === undefined) {
+    throw new Error("従業員シートの並び替え用見出しが見つかりません");
+  }
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
     requestBody: {
-      requests: [{
-        sortRange: {
-          range: {
-            sheetId: employeeSheetId,
-            startRowIndex: 2,
-            endRowIndex: 1000,
-            startColumnIndex: 0,
-            endColumnIndex: Math.max(employeeSheet.headers.length, botHeaders.length),
+      requests: [
+        {
+          updateDimensionProperties: {
+            range: {
+              sheetId: employeeSheetId,
+              dimension: "COLUMNS",
+              startIndex: priorityColumn,
+              endIndex: priorityColumn + 1,
+            },
+            properties: { hiddenByUser: true },
+            fields: "hiddenByUser",
           },
-          sortSpecs: [{ dimensionIndex: 0, sortOrder: "ASCENDING" }],
         },
-      }],
+        {
+          sortRange: {
+            range: {
+              sheetId: employeeSheetId,
+              startRowIndex: 2,
+              endRowIndex: 1000,
+              startColumnIndex: 0,
+              endColumnIndex: Math.max(employeeSheet.headers.length, botHeaders.length),
+            },
+            sortSpecs: [
+              { dimensionIndex: priorityColumn, sortOrder: "ASCENDING" },
+              { dimensionIndex: nameColumn, sortOrder: "ASCENDING" },
+            ],
+          },
+        },
+      ],
     },
   });
 }
@@ -421,6 +445,7 @@ async function syncMember(member, context = null) {
           "表示名": member.displayName,
           "Discordロール": dismissal.roleName,
           "適用ランク": previousRank,
+          [sortPriorityHeader]: 10000,
         }),
         context,
       );
@@ -450,7 +475,7 @@ async function syncMember(member, context = null) {
 
   if (index < 0) {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, ...employeeFormulas(employeeSheet, targetRow) }),
+      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, [sortPriorityHeader]: assessed.priority, ...employeeFormulas(employeeSheet, targetRow) }),
       context,
     );
     const rowIndex = targetRow - 3;
@@ -458,7 +483,7 @@ async function syncMember(member, context = null) {
     employeeSheet.rows[rowIndex][idColumn] = employeeId(member.id);
   } else {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank }),
+      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, [sortPriorityHeader]: assessed.priority }),
       context,
     );
   }
@@ -481,7 +506,7 @@ async function consolidateEmployeeDuplicates() {
 
   const systemHeaders = new Set([
     "社員ID", "表示名", "Discordロール", "適用ランク",
-    "基本ボーナス", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時",
+    "基本ボーナス", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
   ]);
   const mergeHeaders = employeeSheet.headers.filter((header) => header && !systemHeaders.has(String(header)));
   const mergeData = [];
@@ -519,23 +544,7 @@ async function consolidateEmployeeDuplicates() {
       ranges: uniqueDuplicateIndexes.map((index) => `'従業員'!A${index + 3}:ZZ${index + 3}`),
     },
   });
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{
-        sortRange: {
-          range: {
-            sheetId: employeeSheetId,
-            startRowIndex: 2,
-            endRowIndex: 1000,
-            startColumnIndex: 0,
-            endColumnIndex: Math.max(employeeSheet.headers.length, 21),
-          },
-          sortSpecs: [{ dimensionIndex: 0, sortOrder: "ASCENDING" }],
-        },
-      }],
-    },
-  });
+  await sortEmployees(employeeSheet);
   console.log(`重複統合完了: ${uniqueDuplicateIndexes.length}行を統合`);
   return uniqueDuplicateIndexes.length;
 }
@@ -560,6 +569,7 @@ async function processSheetActions() {
   const targetColumn = employeeSheet.headerMap.get(rankSelectionHeader);
   const triggerColumn = employeeSheet.headerMap.get(actionTriggerHeader);
   const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
+  let needsSort = false;
 
   for (let index = 0; index < employeeSheet.rows.length; index += 1) {
     const row = employeeSheet.rows[index];
@@ -589,6 +599,7 @@ async function processSheetActions() {
         if (!selectedRank) throw new Error("変更後ランクを選択してください");
         const result = await applySelectedRank(guild, member, rankMap, selectedRank, "Google Sheetsの統合操作");
         await syncMember(await guild.members.fetch(discordId));
+        needsSort = true;
         await writeActionResult(employeeSheet, rowNumber, {
           [rankSelectionHeader]: "",
           [actionTriggerHeader]: false,
@@ -614,6 +625,7 @@ async function processSheetActions() {
       if (lastRank === discordRank) {
         const result = await applySelectedRank(guild, member, rankMap, sheetRank, "Google Sheetsの適用ランク直接編集");
         await syncMember(await guild.members.fetch(discordId));
+        needsSort = true;
         await writeActionResult(employeeSheet, rowNumber, {
           "操作結果": `完了: スプシ → Discord (${result.transition})`,
           "操作日時": new Date().toISOString(),
@@ -621,6 +633,7 @@ async function processSheetActions() {
         console.log(`双方向同期: スプシ → Discord ${member.displayName} ${result.transition}`);
       } else {
         await syncMember(member);
+        needsSort = true;
         await writeActionResult(employeeSheet, rowNumber, {
           "操作結果": `完了: Discord → スプシ (${discordRank})`,
           "操作日時": new Date().toISOString(),
@@ -637,6 +650,7 @@ async function processSheetActions() {
       console.error(`シート操作失敗: ${discordId}`, message);
     }
   }
+  if (needsSort) await sortEmployees(await readEmployees());
 }
 
 async function processTerminations() {
@@ -693,23 +707,7 @@ async function processTerminations() {
       spreadsheetId,
       requestBody: { ranges: [...new Set(employeeRangesToClear)] },
     });
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests: [{
-          sortRange: {
-            range: {
-              sheetId: employeeSheetId,
-              startRowIndex: 2,
-              endRowIndex: 1000,
-              startColumnIndex: 0,
-              endColumnIndex: Math.max(employeeSheet.headers.length, 21),
-            },
-            sortSpecs: [{ dimensionIndex: 0, sortOrder: "ASCENDING" }],
-          },
-        }],
-      },
-    });
+    await sortEmployees(employeeSheet);
   }
   if (terminationUpdates.length) {
     await sheets.spreadsheets.values.batchUpdate({
@@ -761,7 +759,7 @@ async function fullSync() {
       requestBody: { valueInputOption: "USER_ENTERED", data: context.pendingData },
     });
   }
-  if (context.pendingClearRanges.length) await sortEmployees(employeeSheet);
+  await sortEmployees(employeeSheet);
   console.log(`全件同期完了: ${members.size}人確認`);
 }
 
@@ -787,8 +785,14 @@ client.once("clientReady", () => {
   }), actionPollInterval);
   console.log(`シート操作・退職処理監視: ${actionPollInterval}ms間隔`);
 });
-client.on("guildMemberAdd", (member) => enqueue("加入", () => syncMember(member)));
-client.on("guildMemberUpdate", (_oldMember, newMember) => enqueue("ロール変更", () => syncMember(newMember)));
+client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
+  await syncMember(member);
+  await sortEmployees(await readEmployees());
+}));
+client.on("guildMemberUpdate", (_oldMember, newMember) => enqueue("ロール変更", async () => {
+  await syncMember(newMember);
+  await sortEmployees(await readEmployees());
+}));
 client.on("guildMemberRemove", (member) => enqueue("脱退", () => markRemoved(member)));
 
 const port = Number(process.env.PORT || 3000);
