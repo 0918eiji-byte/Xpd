@@ -777,7 +777,7 @@ async function processTerminations() {
         || String(employeeRow[employeeIdColumn] || "").trim() === terminatedEmployeeId;
     });
     if (employeeIndex >= 0) employeeRangesToClear.push(`'従業員'!A${employeeIndex + 3}:ZZ${employeeIndex + 3}`);
-    terminationRangesToClear.push(`'${terminationSheetName}'!A${rowNumber}:H${rowNumber}`);
+    terminationRangesToClear.push(`'${terminationSheetName}'!A${rowNumber}:I${rowNumber}`);
     terminationRangesToClear.push(`'${terminationSheetName}'!K${rowNumber}:K${rowNumber}`);
     console.log(`解雇者記録を自動削除: ${terminatedEmployeeId}`);
   }
