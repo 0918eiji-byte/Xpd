@@ -219,6 +219,7 @@ function ref(employeeSheet, header, rowNumber) {
 
 function employeeFormulas(employeeSheet, rowNumber) {
   const id = ref(employeeSheet, "社員ID", rowNumber);
+  const discordRoles = ref(employeeSheet, "Discordロール", rowNumber);
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
   const base = ref(employeeSheet, "基本ボーナス", rowNumber);
   const factor = ref(employeeSheet, "固定係数", rowNumber);
@@ -227,7 +228,7 @@ function employeeFormulas(employeeSheet, rowNumber) {
     "基本ボーナス": `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
     "固定係数": `=IF(${id}="","",1)`,
     "調整額": 0,
-    "見込ボーナス": `=IF(${id}="","",${base}*${factor}+${adjustment})`,
+    "見込ボーナス": `=IF(${id}="","",IF(${discordRoles}="解雇者",0,${base}*${factor}+${adjustment}))`,
   };
 }
 
