@@ -1254,7 +1254,13 @@ async function fetchApplicationPoll(application, setting) {
   if (!channel.messages || typeof channel.messages.fetch !== "function") {
     throw new Error("投票メッセージを取得できないチャンネルです");
   }
-  const message = await channel.messages.fetch(application.pollMessageId);
+  // Poll vote counts change without replacing the cached Message instance.
+  // Always fetch from Discord so the sheet does not keep reading the 0-vote
+  // snapshot that was cached when the bot created the poll.
+  const message = await channel.messages.fetch({
+    message: application.pollMessageId,
+    force: true,
+  });
   const state = pollStateFromMessage(message);
   if (state.pollStatus === "PREVIEW" && state.totalVotes >= setting.pollVoteLimit) {
     const endedMessage = await message.poll.end();
