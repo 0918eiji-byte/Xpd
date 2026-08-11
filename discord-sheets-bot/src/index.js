@@ -932,6 +932,30 @@ function discordNumericId(value) {
   return String(value || "").replace(/^'/, "").match(/\d{17,20}/)?.[0] || "";
 }
 
+function normalizeDiscordUsername(value) {
+  return String(value || "").replace(/^'/, "").replace(/^@/, "").trim().toLowerCase();
+}
+
+async function resolveApplicantDiscordUserId(value) {
+  const numericId = discordNumericId(value);
+  if (numericId) return numericId;
+  const target = normalizeDiscordUsername(value);
+  if (!target) return "";
+
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+  const members = await guild.members.fetch();
+  const usernameMatch = members.find((member) => (
+    member.user.username.toLowerCase() === target
+    || member.user.tag.toLowerCase() === target
+  ));
+  if (usernameMatch) return usernameMatch.id;
+
+  const displayMatches = members.filter((member) => [member.user.globalName, member.displayName]
+    .filter(Boolean)
+    .some((name) => String(name).trim().toLowerCase() === target));
+  return displayMatches.size === 1 ? displayMatches.first().id : "";
+}
+
 function recruitmentSettingFromRow(row, index) {
   const requestedDuration = Number(row[5]);
   const requestedVoteLimit = Number(row[6]);
@@ -949,7 +973,9 @@ function recruitmentSettingFromRow(row, index) {
     pollVoteLimit: Number.isFinite(requestedVoteLimit) && requestedVoteLimit >= 1 && requestedVoteLimit <= 1000
       ? Math.floor(requestedVoteLimit)
       : 5,
-    manualTrigger: isChecked(row[9]),
+    passChannelId: String(row[7] || "").trim(),
+    passMessage: String(row[8] || "").trim() || "合格が決定しました。今後の案内をご確認ください。",
+    manualTrigger: isChecked(row[11]),
   };
 }
 
@@ -968,7 +994,7 @@ function sheetCellInputValue(cell) {
 async function readRecruitmentSettings() {
   const response = await sheets.spreadsheets.get({
     spreadsheetId,
-    ranges: [`'${recruitmentSettingsSheetName}'!A4:K100`],
+    ranges: [`'${recruitmentSettingsSheetName}'!A4:M100`],
     includeGridData: true,
     fields: "sheets.data.rowData.values(userEnteredValue,chipRuns)",
   });
@@ -982,7 +1008,7 @@ async function readRecruitmentSettings() {
 async function writeRecruitmentStatus(setting, status) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!H${setting.rowNumber}:J${setting.rowNumber}`,
+    range: `'${recruitmentSettingsSheetName}'!J${setting.rowNumber}:L${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1001,7 +1027,7 @@ async function applyApplicationRoundFilter(roundName) {
               startRowIndex: 9,
               endRowIndex: 1000,
               startColumnIndex: 0,
-              endColumnIndex: 26,
+              endColumnIndex: 27,
             },
             criteria: {
               24: {
@@ -1094,6 +1120,7 @@ function applicationSheetRow(rowNumber, setting, application, sourceKey) {
     "取込完了・投票作成待ち",
     setting.roundName,
     sourceKey,
+    "",
   ];
 }
 
@@ -1125,6 +1152,7 @@ function applicationFromSheetRow(row, rowNumber) {
     pollChannelId: String(row[22] || "").replace(/^'/, "").trim(),
     processResult: String(row[23] || "").trim(),
     roundName: String(row[24] || "").trim(),
+    passAnnouncementMessageId: String(row[26] || "").replace(/^'/, "").trim(),
   };
 }
 
@@ -1134,7 +1162,7 @@ function truncateDiscord(value, maxLength = 360) {
 }
 
 function applicationLink(rowNumber) {
-  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${applicationSheetId}&range=A${rowNumber}:X${rowNumber}`;
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${applicationSheetId}&range=A${rowNumber}:AA${rowNumber}`;
 }
 
 function applicationEmbed(application, title, color) {
@@ -1239,6 +1267,45 @@ async function fetchApplicationPoll(application, setting) {
   return state;
 }
 
+async function sendApplicationPass(setting, application) {
+  const channel = await textChannel(setting.passChannelId, "合格発表");
+  const title = `${setting.roundName} 合格発表`;
+  const userId = await resolveApplicantDiscordUserId(application.discordId);
+  if (channel.messages && typeof channel.messages.fetch === "function") {
+    const recentMessages = await channel.messages.fetch({ limit: 100 });
+    const existing = recentMessages.find((message) => (
+      message.author?.id === client.user?.id
+      && message.embeds.some((embed) => embed.title === title && embed.url === applicationLink(application.rowNumber))
+    ));
+    if (existing) {
+      return { messageId: existing.id, applicantMatched: Boolean(userId) };
+    }
+  }
+
+  const content = [setting.passMessage, userId ? `<@${userId}>` : ""].filter(Boolean).join("\n");
+  const embed = applicationEmbed(application, title, 0x16a34a)
+    .setDescription(`投票結果: 合格票 ${application.passVotes}/${application.totalVotes}票`);
+  const message = await channel.send({
+    content: content || undefined,
+    embeds: [embed],
+    allowedMentions: { users: userId ? [userId] : [] },
+  });
+  return { messageId: message.id, applicantMatched: Boolean(userId) };
+}
+
+async function writeApplicationAnnouncementState(rowNumber, messageId, result) {
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: [
+        { range: `'${applicationSheetName}'!X${rowNumber}`, values: [[result]] },
+        { range: `'${applicationSheetName}'!AA${rowNumber}`, values: [[discordIdCell(messageId)]] },
+      ],
+    },
+  });
+}
+
 function applicationPollStateChanged(application, state) {
   return application.pollStatus !== state.pollStatus
     || application.passVotes !== state.passVotes
@@ -1285,7 +1352,7 @@ async function processRecruitmentApplications() {
     readRecruitmentSettings(),
     sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `'${applicationSheetName}'!A11:Z1000`,
+      range: `'${applicationSheetName}'!A11:AA1000`,
       valueRenderOption: "UNFORMATTED_VALUE",
     }),
   ]);
@@ -1306,6 +1373,9 @@ async function processRecruitmentApplications() {
       }
       if (setting.pollChannelId && !/^\d{17,20}$/.test(setting.pollChannelId)) {
         throw new Error("投票チャンネルIDの形式が正しくありません");
+      }
+      if (setting.passChannelId && !/^\d{17,20}$/.test(setting.passChannelId)) {
+        throw new Error("合格発表チャンネルIDの形式が正しくありません");
       }
       const responseSheetName = await resolveResponseSheetName(responseSpreadsheetId, setting.responseSheetName);
       const formResponse = await sheets.spreadsheets.values.get({
@@ -1347,7 +1417,7 @@ async function processRecruitmentApplications() {
           requestBody: {
             valueInputOption: "USER_ENTERED",
             data: newRows.map(({ rowNumber, values }) => ({
-              range: `'${applicationSheetName}'!A${rowNumber}:Z${rowNumber}`,
+              range: `'${applicationSheetName}'!A${rowNumber}:AA${rowNumber}`,
               values: [values],
             })),
           },
@@ -1356,6 +1426,7 @@ async function processRecruitmentApplications() {
 
       let pollCreatedCount = 0;
       let pollUpdatedCount = 0;
+      let passAnnouncementCount = 0;
       const roundApplications = rows
         .map((row, index) => applicationFromSheetRow(row || [], index + 11))
         .filter((application) => application.id && application.roundName === setting.roundName);
@@ -1383,29 +1454,53 @@ async function processRecruitmentApplications() {
           continue;
         }
 
-        if (application.pollStatus === "FINAL") continue;
-        try {
-          const state = await fetchApplicationPoll(application, setting);
-          if (!applicationPollStateChanged(application, state)) continue;
-          await writeApplicationPollState(application.rowNumber, state);
-          Object.assign(application, state);
-          pollUpdatedCount += 1;
-        } catch (error) {
-          await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: `'${applicationSheetName}'!X${application.rowNumber}`,
-            valueInputOption: "RAW",
-            requestBody: { values: [[`投票読込エラー: ${error.message}`]] },
-          });
+        if (application.pollStatus !== "FINAL") {
+          try {
+            const state = await fetchApplicationPoll(application, setting);
+            if (applicationPollStateChanged(application, state)) {
+              await writeApplicationPollState(application.rowNumber, state);
+              Object.assign(application, state);
+              pollUpdatedCount += 1;
+            }
+          } catch (error) {
+            await sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range: `'${applicationSheetName}'!X${application.rowNumber}`,
+              valueInputOption: "RAW",
+              requestBody: { values: [[`投票読込エラー: ${error.message}`]] },
+            });
+          }
+        }
+
+        if (application.pollStatus === "FINAL"
+          && application.verdict === "合格"
+          && setting.passChannelId
+          && !application.passAnnouncementMessageId) {
+          try {
+            const announcement = await sendApplicationPass(setting, application);
+            const result = `${application.processResult || "投票結果を確定"} / 合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+            await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
+            application.passAnnouncementMessageId = announcement.messageId;
+            application.processResult = result;
+            passAnnouncementCount += 1;
+          } catch (error) {
+            await sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range: `'${applicationSheetName}'!X${application.rowNumber}`,
+              valueInputOption: "RAW",
+              requestBody: { values: [[`合格発表エラー: ${error.message}`]] },
+            });
+          }
         }
       }
 
       const previewCount = roundApplications.filter((application) => application.pollStatus === "PREVIEW").length;
       const finalCount = roundApplications.filter((application) => application.pollStatus === "FINAL").length;
       const channelWait = !setting.pollChannelId ? " / 投票チャンネル待ち" : "";
+      const announcementStatus = setting.passChannelId ? ` / 合格発表${passAnnouncementCount}件` : " / 合格発表なし";
       await writeRecruitmentStatus(
         setting,
-        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件 / 締切${setting.pollDurationHours}時間または${setting.pollVoteLimit}票${channelWait}`,
+        `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件 / 締切${setting.pollDurationHours}時間または${setting.pollVoteLimit}票${announcementStatus}${channelWait}`,
       );
     } catch (error) {
       const message = error.response?.data?.error?.message || error.message || String(error);
