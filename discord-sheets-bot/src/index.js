@@ -70,7 +70,7 @@ async function readRankMap() {
 function assessMember(member, rankMap) {
   const matches = member.roles.cache
     .map((role) => rankMap.get(role.id))
-    .filter(Boolean)
+    .filter((rank) => rank && rank.rankName !== "解雇者")
     .sort((a, b) => a.priority - b.priority);
   return {
     roleNames: [...new Set(matches.map((item) => item.roleName))].join(", "),
@@ -79,7 +79,13 @@ function assessMember(member, rankMap) {
 }
 
 function sortedRanks(rankMap) {
-  return [...rankMap.values()].sort((a, b) => a.priority - b.priority);
+  return [...rankMap.values()]
+    .filter((rank) => rank.rankName !== "解雇者")
+    .sort((a, b) => a.priority - b.priority);
+}
+
+function dismissedRank(rankMap) {
+  return [...rankMap.values()].find((rank) => rank.rankName === "解雇者") || null;
 }
 
 function columnLetter(index) {
@@ -95,6 +101,10 @@ function columnLetter(index) {
 
 const actionHeaders = ["昇格", "降格", "解雇"];
 const botHeaders = ["社員ID", "表示名", "DiscordユーザーID", "入社日", "雇用状態", "手動ランク", "Discordロール", "同期ランク", "適用ランク", "基本ボーナス", "固定係数", "調整額", "見込ボーナス", "最終同期", "メモ", ...actionHeaders, "操作結果", "操作日時"];
+const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
+const terminationSheetName = "解雇者管理";
+const employeeSheetId = 1100459512;
+const retentionPeriodMs = 7 * 24 * 60 * 60 * 1000;
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -163,6 +173,34 @@ function employeeId(discordId) {
   return `DC-${discordId}`;
 }
 
+async function readTerminations() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${terminationSheetName}'!A2:K500`,
+  });
+  const values = response.data.values || [];
+  const headers = values[0] || terminationHeaders;
+  return {
+    headers,
+    headerMap: new Map(headers.map((header, index) => [String(header), index])),
+    rows: values.slice(1),
+  };
+}
+
+function terminationCellRange(terminationSheet, header, rowNumber) {
+  const index = terminationSheet.headerMap.get(header);
+  if (index === undefined) throw new Error(`${terminationSheetName}シートに「${header}」列がありません。`);
+  const col = columnLetter(index);
+  return `'${terminationSheetName}'!${col}${rowNumber}`;
+}
+
+function terminationRowUpdate(terminationSheet, rowNumber, fields) {
+  return Object.entries(fields).map(([header, value]) => ({
+    range: terminationCellRange(terminationSheet, header, rowNumber),
+    values: [[value]],
+  }));
+}
+
 function discordIdCell(discordId) {
   return `'${discordId}`;
 }
@@ -177,6 +215,38 @@ function normalizedDiscordId(row, employeeSheet) {
 
 function isChecked(value) {
   return value === true || String(value || "").toUpperCase() === "TRUE";
+}
+
+async function upsertTerminationRecord(member, finalRank = "") {
+  const terminationSheet = await readTerminations();
+  const employeeIdColumn = terminationSheet.headerMap.get("社員ID");
+  const discordIdColumn = terminationSheet.headerMap.get("DiscordユーザーID");
+  const finalRankColumn = terminationSheet.headerMap.get("最終ランク");
+  const index = terminationSheet.rows.findIndex((row) => {
+    const discordId = String(row[discordIdColumn] || "").replace(/^'/, "").trim();
+    return discordId === member.id || String(row[employeeIdColumn] || "").trim() === employeeId(member.id);
+  });
+  const emptyIndex = terminationSheet.rows.findIndex((row) => !String(row[employeeIdColumn] || "").trim());
+  const rowNumber = index >= 0 ? index + 3 : emptyIndex >= 0 ? emptyIndex + 3 : terminationSheet.rows.length + 3;
+  const existingRank = index >= 0 ? String(terminationSheet.rows[index][finalRankColumn] || "").trim() : "";
+  const fields = {
+    "社員ID": employeeId(member.id),
+    "表示名": member.displayName,
+    "DiscordユーザーID": discordIdCell(member.id),
+  };
+  if (finalRank && !existingRank) fields["最終ランク"] = finalRank;
+  if (index < 0) {
+    fields["解雇日"] = new Date().toISOString();
+    fields["手続き完了"] = false;
+  }
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: terminationRowUpdate(terminationSheet, rowNumber, fields),
+    },
+  });
+  return rowNumber;
 }
 
 async function applyEmployeeUpdates(data, context) {
@@ -204,8 +274,37 @@ async function syncMember(member, context = null) {
   const targetRow = index >= 0 ? index + 3 : emptyIndex >= 0 ? emptyIndex + 3 : employeeSheet.rows.length + 3;
   const hasRosterRole = [...rosterRoleIds].some((id) => member.roles.cache.has(id));
   const hasExcludeRole = [...excludeRoleIds].some((id) => member.roles.cache.has(id));
-  const eligible = hasRosterRole && !hasExcludeRole;
+  const dismissal = dismissedRank(rankMap);
+  const hasDismissedRole = Boolean(dismissal && member.roles.cache.has(dismissal.roleId));
+  const assessed = assessMember(member, rankMap);
   const now = new Date().toISOString();
+
+  if (hasDismissedRole) {
+    const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
+    const syncedRankColumn = employeeSheet.headerMap.get("同期ランク");
+    const previousRank = assessed.rankName || (index >= 0
+      ? String(employeeSheet.rows[index][appliedRankColumn] || employeeSheet.rows[index][syncedRankColumn] || "").trim()
+      : "");
+    await upsertTerminationRecord(member, previousRank);
+    if (index >= 0) {
+      await applyEmployeeUpdates(
+        rowUpdate(employeeSheet, targetRow, {
+          "表示名": member.displayName,
+          "DiscordユーザーID": discordIdCell(member.id),
+          "雇用状態": "退職",
+          "Discordロール": dismissal.roleName,
+          "同期ランク": "",
+          "最終同期": now,
+          "メモ": "解雇者ロール検知",
+        }),
+        context,
+      );
+    }
+    console.log(`解雇者ロール検知: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
+    return;
+  }
+
+  const eligible = hasRosterRole && !hasExcludeRole;
 
   if (!eligible) {
     if (index < 0) return;
@@ -217,7 +316,6 @@ async function syncMember(member, context = null) {
     return;
   }
 
-  const assessed = assessMember(member, rankMap);
   if (index < 0) {
     await applyEmployeeUpdates(
       rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "DiscordユーザーID": discordIdCell(member.id), "入社日": member.joinedAt?.toISOString() || now, "雇用状態": "在籍", "手動ランク": "", "Discordロール": assessed.roleNames, "同期ランク": assessed.rankName, ...employeeFormulas(employeeSheet, targetRow), "最終同期": now, "メモ": "Railway Bot自動登録" }),
@@ -300,7 +398,7 @@ async function consolidateEmployeeDuplicates() {
       requests: [{
         sortRange: {
           range: {
-            sheetId: 1100459512,
+            sheetId: employeeSheetId,
             startRowIndex: 2,
             endRowIndex: 1000,
             startColumnIndex: 0,
@@ -333,6 +431,11 @@ async function executeRankAction(guild, member, rankMap, action) {
   const currentIndex = current ? ranks.findIndex((rank) => rank.roleId === current.roleId) : -1;
 
   if (action === "解雇") {
+    const dismissal = dismissedRank(rankMap);
+    if (!dismissal) throw new Error("ランク設定に有効な「解雇者」ロールがありません");
+    const dismissalRole = guild.roles.cache.get(dismissal.roleId);
+    if (!dismissalRole) throw new Error(`解雇者ロールが見つかりません: ${dismissal.roleId}`);
+    if (!dismissalRole.editable) throw new Error(`Botより上位のロールは付与できません: ${dismissalRole.name}`);
     const removeIds = [...new Set([
       ...ranks.filter((rank) => member.roles.cache.has(rank.roleId)).map((rank) => rank.roleId),
       ...[...rosterRoleIds].filter((roleId) => member.roles.cache.has(roleId)),
@@ -342,8 +445,9 @@ async function executeRankAction(guild, member, rankMap, action) {
       .filter((role) => role && !role.editable)
       .map((role) => role.name);
     if (blocked.length) throw new Error(`Botより上位のロールは解除できません: ${blocked.join(", ")}`);
+    if (!member.roles.cache.has(dismissal.roleId)) await member.roles.add(dismissal.roleId, "Google Sheetsから解雇");
     if (removeIds.length) await member.roles.remove(removeIds, "Google Sheetsから解雇");
-    return `${current?.rankName || "階級なし"} → 退職`;
+    return { transition: `${current?.rankName || "階級なし"} → 解雇者`, previousRank: current?.rankName || "" };
   }
 
   let target;
@@ -370,7 +474,7 @@ async function executeRankAction(guild, member, rankMap, action) {
   if (blocked.length) throw new Error(`Botより上位のロールは解除できません: ${blocked.join(", ")}`);
   if (removeIds.length) await member.roles.remove(removeIds, `Google Sheetsから${action}`);
   if (!member.roles.cache.has(target.roleId)) await member.roles.add(target.roleId, `Google Sheetsから${action}`);
-  return `${current?.rankName || "階級なし"} → ${target.rankName}`;
+  return { transition: `${current?.rankName || "階級なし"} → ${target.rankName}`, previousRank: current?.rankName || "" };
 }
 
 async function processSheetActions() {
@@ -412,16 +516,16 @@ async function processSheetActions() {
     await writeActionResult(employeeSheet, rowNumber, { "操作結果": `処理中: ${action}` });
     try {
       const member = await guild.members.fetch(discordId);
-      const transition = await executeRankAction(guild, member, rankMap, action);
+      const result = await executeRankAction(guild, member, rankMap, action);
       await writeActionResult(employeeSheet, rowNumber, {
         ...resetFields,
         "手動ランク": "",
         "雇用状態": action === "解雇" ? "退職" : "在籍",
-        "操作結果": `完了: ${action} (${transition})`,
+        "操作結果": `完了: ${action} (${result.transition})`,
         "操作日時": new Date().toISOString(),
       });
-      if (action !== "解雇") await syncMember(await guild.members.fetch(discordId));
-      console.log(`シート操作完了: ${member.displayName} ${action} ${transition}`);
+      await syncMember(await guild.members.fetch(discordId));
+      console.log(`シート操作完了: ${member.displayName} ${action} ${result.transition}`);
     } catch (error) {
       const message = error.response?.data?.message || error.message || String(error);
       await writeActionResult(employeeSheet, rowNumber, {
@@ -434,26 +538,114 @@ async function processSheetActions() {
   }
 }
 
+async function processTerminations() {
+  const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
+  const completeColumn = terminationSheet.headerMap.get("手続き完了");
+  const handlerColumn = terminationSheet.headerMap.get("対応署員");
+  const completedAtColumn = terminationSheet.headerMap.get("完了日");
+  const deletionStatusColumn = terminationSheet.headerMap.get("名簿削除状況");
+  const noteColumn = terminationSheet.headerMap.get("備考");
+  const terminationEmployeeIdColumn = terminationSheet.headerMap.get("社員ID");
+  const terminationDiscordIdColumn = terminationSheet.headerMap.get("DiscordユーザーID");
+  const employeeIdColumn = employeeSheet.headerMap.get("社員ID");
+  const now = new Date();
+  const terminationUpdates = [];
+  const employeeRangesToClear = [];
+
+  for (let index = 0; index < terminationSheet.rows.length; index += 1) {
+    const row = terminationSheet.rows[index];
+    if (!String(row[terminationEmployeeIdColumn] || "").trim()) continue;
+    if (!isChecked(row[completeColumn])) continue;
+    if (!String(row[handlerColumn] || "").trim()) continue;
+    if (String(row[deletionStatusColumn] || "").trim() === "削除済") continue;
+
+    const rowNumber = index + 3;
+    const completedAtText = String(row[completedAtColumn] || "").trim();
+    if (!completedAtText) {
+      terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, { "完了日": now.toISOString() }));
+      console.log(`退職手続き完了日を記録: ${row[terminationEmployeeIdColumn]}`);
+      continue;
+    }
+
+    const completedAt = new Date(completedAtText);
+    if (Number.isNaN(completedAt.getTime()) || now.getTime() < completedAt.getTime() + retentionPeriodMs) continue;
+
+    const discordId = String(row[terminationDiscordIdColumn] || "").replace(/^'/, "").trim();
+    const terminatedEmployeeId = String(row[terminationEmployeeIdColumn] || "").trim();
+    const employeeIndex = employeeSheet.rows.findIndex((employeeRow) => {
+      const candidateDiscordId = normalizedDiscordId(employeeRow, employeeSheet);
+      return (discordId && candidateDiscordId === discordId)
+        || String(employeeRow[employeeIdColumn] || "").trim() === terminatedEmployeeId;
+    });
+    if (employeeIndex >= 0) employeeRangesToClear.push(`'従業員'!A${employeeIndex + 3}:ZZ${employeeIndex + 3}`);
+    const currentNote = String(row[noteColumn] || "").trim();
+    const deletionNote = `退職手続き完了から7日経過のため名簿から自動削除: ${now.toISOString()}`;
+    terminationUpdates.push(...terminationRowUpdate(terminationSheet, rowNumber, {
+      "名簿削除状況": "削除済",
+      "備考": [currentNote, deletionNote].filter(Boolean).join(" / "),
+    }));
+    console.log(`名簿自動削除: ${terminatedEmployeeId}`);
+  }
+
+  if (employeeRangesToClear.length) {
+    await sheets.spreadsheets.values.batchClear({
+      spreadsheetId,
+      requestBody: { ranges: [...new Set(employeeRangesToClear)] },
+    });
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          sortRange: {
+            range: {
+              sheetId: employeeSheetId,
+              startRowIndex: 2,
+              endRowIndex: 1000,
+              startColumnIndex: 0,
+              endColumnIndex: Math.max(employeeSheet.headers.length, 21),
+            },
+            sortSpecs: [{ dimensionIndex: 0, sortOrder: "ASCENDING" }],
+          },
+        }],
+      },
+    });
+  }
+  if (terminationUpdates.length) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: terminationUpdates },
+    });
+  }
+}
+
 async function fullSync() {
   const guild = await client.guilds.fetch(guildId);
   const members = await guild.members.fetch();
+  const rankMap = await readRankMap();
+  const dismissal = dismissedRank(rankMap);
   const missingRosterRoles = [...rosterRoleIds].filter((id) => !guild.roles.cache.has(id));
   if (missingRosterRoles.length) {
     throw new Error(`ROSTER_ROLE_IDがこのサーバーに存在しません: ${missingRosterRoles.join(", ")}`);
+  }
+  if (!dismissal) throw new Error("ランク設定に有効な「解雇者」ロールがありません");
+  if (!guild.roles.cache.has(dismissal.roleId)) {
+    throw new Error(`解雇者ロールがこのサーバーに存在しません: ${dismissal.roleId}`);
   }
   const rosterNames = [...rosterRoleIds].map((id) => guild.roles.cache.get(id)?.name || id);
   const eligibleCount = members.filter((member) =>
     !member.user.bot &&
     [...rosterRoleIds].some((id) => member.roles.cache.has(id)) &&
-    ![...excludeRoleIds].some((id) => member.roles.cache.has(id)),
+    ![...excludeRoleIds].some((id) => member.roles.cache.has(id)) &&
+    !member.roles.cache.has(dismissal.roleId),
   ).size;
   console.log(`名簿対象ロール: ${rosterNames.join(", ")}`);
+  console.log(`解雇者判定ロール: ${dismissal.roleName} (${dismissal.roleId})`);
   console.log(`名簿対象人数: ${eligibleCount}人`);
   if (eligibleCount === 0) {
     throw new Error("名簿対象者が0人です。ROSTER_ROLE_IDが全署員に共通するロールか確認してください。");
   }
   await consolidateEmployeeDuplicates();
-  const [rankMap, employeeSheet] = await Promise.all([readRankMap(), readEmployees()]);
+  const employeeSheet = await readEmployees();
   const context = { rankMap, employeeSheet, pendingData: [] };
   for (const member of members.values()) await syncMember(member, context);
   if (context.pendingData.length) {
@@ -486,8 +678,11 @@ client.once("clientReady", () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
   enqueue("起動時全件同期", fullSync);
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 5000), 3000);
-  setInterval(() => enqueue("シート操作", processSheetActions), actionPollInterval);
-  console.log(`シート操作監視: ${actionPollInterval}ms間隔`);
+  setInterval(() => enqueue("シート操作・退職処理", async () => {
+    await processSheetActions();
+    await processTerminations();
+  }), actionPollInterval);
+  console.log(`シート操作・退職処理監視: ${actionPollInterval}ms間隔`);
 });
 client.on("guildMemberAdd", (member) => enqueue("加入", () => syncMember(member)));
 client.on("guildMemberUpdate", (_oldMember, newMember) => enqueue("ロール変更", () => syncMember(newMember)));
