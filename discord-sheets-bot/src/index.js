@@ -943,17 +943,18 @@ function recruitmentSettingFromRow(row, index) {
     responseSpreadsheetUrl: String(row[2] || "").trim(),
     responseSheetName: "",
     reminderChannelId: String(row[3] || "").trim(),
-    passChannelId: String(row[4] || "").trim(),
-    mentionRoleId: String(row[5] || "").trim(),
-    threshold: Math.min(Math.max(Number(row[6]) || 3, 1), 5),
-    manualTrigger: isChecked(row[9]),
+    reminderMessage: String(row[4] || "").trim() || "新しい応募が届きました。内容を確認してください。",
+    passChannelId: String(row[5] || "").trim(),
+    passMessage: String(row[6] || "").trim() || "合格が決定しました。今後の案内をご確認ください。",
+    threshold: Math.min(Math.max(Number(row[7]) || 3, 1), 5),
+    manualTrigger: isChecked(row[10]),
   };
 }
 
 async function readRecruitmentSettings() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!A4:J100`,
+    range: `'${recruitmentSettingsSheetName}'!A4:K100`,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
   return (response.data.values || []).map(recruitmentSettingFromRow).filter((setting) => setting.roundName);
@@ -962,7 +963,7 @@ async function readRecruitmentSettings() {
 async function writeRecruitmentStatus(setting, status) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!H${setting.rowNumber}:J${setting.rowNumber}`,
+    range: `'${recruitmentSettingsSheetName}'!I${setting.rowNumber}:K${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1068,7 +1069,7 @@ function applicationSheetRow(rowNumber, setting, application, sourceKey) {
     false,
     false,
     `=COUNTIF(O${rowNumber}:S${rowNumber},TRUE)`,
-    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$G$4:$G$100),3),"合格","審査中"))`,
+    `=IF(A${rowNumber}="","",IF(T${rowNumber}>=IFNA(XLOOKUP(Y${rowNumber},'${recruitmentSettingsSheetName}'!$B$4:$B$100,'${recruitmentSettingsSheetName}'!$H$4:$H$100),3),"合格","審査中"))`,
     "",
     "",
     "取込完了",
@@ -1167,13 +1168,12 @@ async function resolveApplicantDiscordUserId(value) {
   return displayMatches.size === 1 ? displayMatches.first().id : "";
 }
 
-async function notificationMentions(setting, application) {
+async function notificationMentions(application, message) {
   const userId = await resolveApplicantDiscordUserId(application.discordId);
-  const roleId = /^\d{17,20}$/.test(setting.mentionRoleId) ? setting.mentionRoleId : "";
+  const description = String(message || "").trim();
   return {
-    content: [roleId ? `<@&${roleId}>` : "", userId ? `<@${userId}>` : ""].filter(Boolean).join(" ") || undefined,
+    content: [description, userId ? `<@${userId}>` : ""].filter(Boolean).join("\n") || undefined,
     allowedMentions: {
-      roles: roleId ? [roleId] : [],
       users: userId ? [userId] : [],
     },
     applicantMatched: Boolean(userId),
@@ -1183,7 +1183,7 @@ async function notificationMentions(setting, application) {
 
 async function sendApplicationReminder(setting, application) {
   const channel = await textChannel(setting.reminderChannelId, "リマインド");
-  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(setting, application);
+  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(application, setting.reminderMessage);
   await channel.send({
     ...mentions,
     embeds: [applicationEmbed(application, `${setting.roundName} 新規応募リマインド`, 0x2563eb)],
@@ -1193,7 +1193,7 @@ async function sendApplicationReminder(setting, application) {
 
 async function sendApplicationPass(setting, application) {
   const channel = await textChannel(setting.passChannelId, "合格通知");
-  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(setting, application);
+  const { applicantMatched, userId: _userId, ...mentions } = await notificationMentions(application, setting.passMessage);
   const embed = applicationEmbed(application, `${setting.roundName} 合格判定`, 0x16a34a)
     .setDescription(`審査チェック ${application.checks}/${setting.threshold} に到達しました。`);
   await channel.send({ ...mentions, embeds: [embed] });
