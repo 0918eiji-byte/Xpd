@@ -206,6 +206,21 @@ async function fullSync() {
   const guild = await client.guilds.fetch(guildId);
   const members = await guild.members.fetch();
   for (const member of members.values()) await syncMember(member);
+  const missingRosterRoles = [...rosterRoleIds].filter((id) => !guild.roles.cache.has(id));
+  if (missingRosterRoles.length) {
+    throw new Error(`ROSTER_ROLE_IDがこのサーバーに存在しません: ${missingRosterRoles.join(", ")}`);
+  }
+  const rosterNames = [...rosterRoleIds].map((id) => guild.roles.cache.get(id)?.name || id);
+  const eligibleCount = members.filter((member) =>
+    !member.user.bot &&
+    [...rosterRoleIds].some((id) => member.roles.cache.has(id)) &&
+    ![...excludeRoleIds].some((id) => member.roles.cache.has(id)),
+  ).size;
+  console.log(`名簿対象ロール: ${rosterNames.join(", ")}`);
+  console.log(`名簿対象人数: ${eligibleCount}人`);
+  if (eligibleCount === 0) {
+    throw new Error("名簿対象者が0人です。ROSTER_ROLE_IDが全署員に共通するロールか確認してください。");
+  }
   console.log(`全件同期完了: ${members.size}人確認`);
 }
 
