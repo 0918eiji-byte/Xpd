@@ -262,14 +262,14 @@ const bonusDistributionSheetId = 1863429017;
 const bonusRoundSettingsSheetName = "ボーナス回設定";
 let displayedBonusRound = "";
 const recruitmentSettingsSheetName = "募集設定";
-const applicationSheetName = "応募管理";
+const applicationSheetName = "応募者管理";
 const applicationSheetId = 2081134610;
 let displayedApplicationRound = "";
 let lastRecruitmentPollAt = 0;
 const recruitmentPollIntervalMs = Math.max(Number(process.env.RECRUITMENT_POLL_INTERVAL_MS || 60000), 30000);
 const interviewSettingsSheetName = "面接設定";
-const interviewQuestionsSheetName = "面接質問";
-const interviewManagementSheetName = "面接管理";
+const interviewQuestionsSheetName = "面接質問設定";
+const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
