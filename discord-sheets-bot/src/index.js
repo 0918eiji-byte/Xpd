@@ -8,7 +8,6 @@ import {
   GatewayIntentBits,
   MessageFlags,
   ModalBuilder,
-  PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
@@ -1813,7 +1812,9 @@ async function reserveInterview(setting, application, interviewer, questions) {
 function canInterview(interaction, setting) {
   if (interaction.guildId !== guildId || interaction.channelId !== setting.commandChannelId) return false;
   if (setting.interviewerRoleId) return Boolean(interaction.member?.roles?.cache?.has(setting.interviewerRoleId));
-  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
+  // ロール未設定時は、設定済みの非公開チャンネルにアクセスできる人を面接官として扱う。
+  // 初回導入時にロールIDの登録を必須にせず、必要になった時点で制限を追加できる。
+  return true;
 }
 
 function interviewSessionComponents(record, ready = false) {
