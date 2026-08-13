@@ -1873,20 +1873,30 @@ async function readStep1Applications() {
 
 async function eligibleInterviewApplications(setting, search = "") {
   const [applications, records] = await Promise.all([readStep1Applications(), readInterviewRecords()]);
-  const reserved = new Set(records
-    .filter((record) => record.interviewStatus !== "CANCELLED")
+  const activeRecords = records.filter((record) => record.interviewStatus !== "CANCELLED");
+  const reserved = new Set(activeRecords
     .map((record) => record.applicationId));
+  const reservedApplicants = new Set(activeRecords.map((record) => (
+    record.applicantDiscordId || normalizeDiscordUsername(record.applicantDiscordName)
+  )).filter(Boolean));
   const needle = String(search || "").trim().toLowerCase();
-  return applications.filter((application) => (
+  const candidates = applications.filter((application) => (
     application.pollStatus === "FINAL"
     && application.verdict === "合格"
     && application.passAnnouncementMessageId
     && application.documentRoleStatus.startsWith("書類合格ロール付与済")
     && (!setting.roundName || application.roundName === setting.roundName)
-    && !reserved.has(application.id)
     && (!needle || [application.id, application.name, application.discordId]
       .some((value) => String(value || "").toLowerCase().includes(needle)))
   ));
+  const latestByApplicant = new Map();
+  for (const application of candidates) {
+    const key = application.resolvedDiscordId || normalizeDiscordUsername(application.discordId) || application.id;
+    latestByApplicant.set(key, application);
+  }
+  return [...latestByApplicant.entries()]
+    .filter(([key, application]) => !reserved.has(application.id) && !reservedApplicants.has(key))
+    .map(([, application]) => application);
 }
 
 function interviewQuestionsText(questions) {
@@ -2318,8 +2328,17 @@ async function reconcileInterviewDecision(guild, setting, recruitmentSetting, re
       record.roleStatus = status;
     }
     const applications = await readStep1Applications();
-    const application = applications.find((item) => item.id === record.applicationId);
-    if (application && application.documentRoleStatus !== status) await updateApplicationRoleState(application, userId, status);
+    const linkedApplications = applications.filter((item) => (
+      item.roundName === record.roundName
+      && (item.id === record.applicationId
+        || item.resolvedDiscordId === userId
+        || normalizeDiscordUsername(item.discordId) === normalizeDiscordUsername(record.applicantDiscordName))
+    ));
+    for (const application of linkedApplications) {
+      if (application.documentRoleStatus !== status || application.resolvedDiscordId !== userId) {
+        await updateApplicationRoleState(application, userId, status);
+      }
+    }
     if (record.verdict === "合格") await upsertOnboardingRecord(record);
     return true;
   } catch (error) {
