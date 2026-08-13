@@ -1461,7 +1461,22 @@ async function resolveApplicationMember(guild, application) {
   return { userId, member };
 }
 
-async function reconcileStep1DocumentRole(guild, setting, application) {
+function sameApplicant(application, other, resolvedUserId) {
+  if (other.id === application.id) return false;
+  if (resolvedUserId && other.resolvedDiscordId === resolvedUserId) return true;
+  const left = normalizeDiscordUsername(application.discordId);
+  const right = normalizeDiscordUsername(other.discordId);
+  return Boolean(left && right && left === right);
+}
+
+function isActiveStep1Pass(application) {
+  return application.pollStatus === "FINAL"
+    && application.verdict === "合格"
+    && !application.documentRoleStatus.startsWith("面接結果反映済")
+    && !application.documentRoleStatus.startsWith("採用完了");
+}
+
+async function reconcileStep1DocumentRole(guild, setting, application, allApplications = []) {
   if (application.pollStatus !== "FINAL" || !["合格", "不合格"].includes(application.verdict)) return false;
   const documentRoleId = configuredRoleId(guild, setting.documentPassRoleId, ["書類合格者", "書類合格"]);
   if (!documentRoleId) {
@@ -1481,6 +1496,16 @@ async function reconcileStep1DocumentRole(guild, setting, application) {
       }
       return result.added.length > 0;
     } else {
+      const anotherPassExists = allApplications.some((other) => (
+        isActiveStep1Pass(other) && sameApplicant(application, other, userId)
+      ));
+      if (anotherPassExists) {
+        const status = "書類不合格・別の合格応募があるためロール維持";
+        if (application.documentRoleStatus !== status || application.resolvedDiscordId !== userId) {
+          await updateApplicationRoleState(application, userId, status);
+        }
+        return false;
+      }
       const result = await reconcileMemberRoles(guild, member, { remove: [documentRoleId] }, `STEP1書類不合格: ${application.id}`);
       const status = "書類不合格・ロール解除済";
       if (application.documentRoleStatus !== status || application.resolvedDiscordId !== userId) {
@@ -1663,7 +1688,7 @@ async function processRecruitmentApplications() {
         }
 
         if (application.pollStatus === "FINAL") {
-          if (await reconcileStep1DocumentRole(guild, setting, application)) documentRoleCount += 1;
+          if (await reconcileStep1DocumentRole(guild, setting, application, roundApplications)) documentRoleCount += 1;
         }
 
         if (application.pollStatus === "FINAL"
