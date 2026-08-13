@@ -71,31 +71,14 @@ const unifiedSettingsBlocks = new Map([
 ]);
 let unifiedSettingsSheetId = null;
 let displayedSettingsCategory = "";
-let unifiedReadyCache = { checkedAt: 0, ready: false };
+let requestedSettingsCategory = "すべて";
 let unifiedSettingsHealthy = false;
 let lastUnifiedAuditAt = 0;
 let unifiedSettingsSnapshot = null;
 
 async function unifiedSettingsReady(force = false) {
-  const now = Date.now();
-  if (!force && now - unifiedReadyCache.checkedAt < 5000) return unifiedReadyCache.ready;
-  try {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${unifiedSettingsSheetName}'!K3`,
-      valueRenderOption: "UNFORMATTED_VALUE",
-    });
-    const ready = String(response.data.values?.[0]?.[0] || "").trim() === unifiedSettingsSchema
-      && unifiedSettingsHealthy;
-    unifiedReadyCache = { checkedAt: now, ready };
-    return ready;
-  } catch (error) {
-    if (error.code === 400 || /Unable to parse range|not found/i.test(error.message || "")) {
-      unifiedReadyCache = { checkedAt: now, ready: false };
-      return false;
-    }
-    throw error;
-  }
+  if (force) await auditUnifiedSettings(true);
+  return Boolean(unifiedSettingsHealthy && unifiedSettingsSnapshot);
 }
 
 function normalizedId(value) {
@@ -114,7 +97,7 @@ function duplicateValues(values) {
 
 async function auditUnifiedSettings(force = false) {
   const now = Date.now();
-  if (!force && now - lastUnifiedAuditAt < 30000) return unifiedSettingsHealthy;
+  if (!force && now - lastUnifiedAuditAt < 120000) return unifiedSettingsHealthy;
   lastUnifiedAuditAt = now;
   let schema = "";
   try {
@@ -122,6 +105,7 @@ async function auditUnifiedSettings(force = false) {
       spreadsheetId,
       ranges: [
         `'${unifiedSettingsSheetName}'!K3`,
+        `'${unifiedSettingsSheetName}'!B3`,
         `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.rank.range}`,
         `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.bonus.range}`,
         `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.recruitment.range}`,
@@ -133,7 +117,8 @@ async function auditUnifiedSettings(force = false) {
     const ranges = response.data.valueRanges || [];
     schema = String(ranges[0]?.values?.[0]?.[0] || "").trim();
     if (schema !== unifiedSettingsSchema) return false;
-    const [rankRows, bonusRows, recruitmentRows, interviewRows, questionRows] = ranges.slice(1).map((range) => range.values || []);
+    requestedSettingsCategory = String(ranges[1]?.values?.[0]?.[0] || "すべて").trim();
+    const [rankRows, bonusRows, recruitmentRows, interviewRows, questionRows] = ranges.slice(2).map((range) => range.values || []);
     const errors = [];
     const snowflake = /^\d{17,20}$/;
     const activeRanks = rankRows.filter((row) => String(row[5] || "").trim() === "はい");
@@ -208,7 +193,6 @@ async function auditUnifiedSettings(force = false) {
         auditedAt: now,
       };
     }
-    unifiedReadyCache = { checkedAt: 0, ready: false };
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: {
@@ -221,6 +205,7 @@ async function auditUnifiedSettings(force = false) {
     });
     return unifiedSettingsHealthy;
   } catch (error) {
+    if (isSheetsQuotaError(error)) lastUnifiedAuditAt = 0;
     if (!schema && (error.code === 400 || /Unable to parse range|not found/i.test(error.message || ""))) return false;
     throw error;
   }
@@ -236,12 +221,7 @@ async function unifiedRange(key) {
 
 async function applyUnifiedSettingsView() {
   if (!await unifiedSettingsReady()) return;
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${unifiedSettingsSheetName}'!B3`,
-    valueRenderOption: "UNFORMATTED_VALUE",
-  });
-  const requested = String(response.data.values?.[0]?.[0] || "すべて").trim();
+  const requested = requestedSettingsCategory;
   const category = requested === "すべて" || unifiedSettingsBlocks.has(requested) ? requested : "すべて";
   if (category === displayedSettingsCategory) return;
   if (unifiedSettingsSheetId === null) {
@@ -272,6 +252,28 @@ const client = new Client({
 
 let queue = Promise.resolve();
 const lastSynchronizedRanks = new Map();
+let sheetsQuotaBackoffUntil = 0;
+let sheetsQuotaBackoffLevel = 0;
+
+function isSheetsQuotaError(error) {
+  const status = Number(error?.code || error?.response?.status || error?.response?.data?.error?.code || 0);
+  const message = String(error?.response?.data?.error?.message || error?.message || error || "");
+  return status === 429 || /quota exceeded|rate limit|read requests per minute|RESOURCE_EXHAUSTED/i.test(message);
+}
+
+function registerSheetsQuotaError(error) {
+  if (!isSheetsQuotaError(error)) return false;
+  sheetsQuotaBackoffLevel = Math.min(sheetsQuotaBackoffLevel + 1, 4);
+  const delayMs = Math.min(60000 * (2 ** (sheetsQuotaBackoffLevel - 1)), 5 * 60000) + Math.floor(Math.random() * 5000);
+  sheetsQuotaBackoffUntil = Math.max(sheetsQuotaBackoffUntil, Date.now() + delayMs);
+  console.error(`Google Sheets読込制限: ${Math.ceil(delayMs / 1000)}秒後に自動再試行します`);
+  return true;
+}
+
+function sheetsBackoffRemainingSeconds() {
+  return Math.max(0, Math.ceil((sheetsQuotaBackoffUntil - Date.now()) / 1000));
+}
+
 function enqueue(label, work) {
   queue = queue.then(work).catch((error) => {
     const message = error.response?.data?.error?.message || error.message || error;
@@ -1308,22 +1310,9 @@ async function readRecruitmentSettings() {
 
 async function writeRecruitmentStatus(setting, status) {
   const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : recruitmentSettingsSheetName;
-  let rowNumber = setting.rowNumber;
-  if (setting.source === "unified") {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${sheetName}'!B${unifiedSettingsRanges.recruitment.firstRow}:B317`,
-      valueRenderOption: "UNFORMATTED_VALUE",
-    });
-    const matches = (response.data.values || [])
-      .map((row, index) => String(row[0] || "").trim() === setting.roundName ? index + unifiedSettingsRanges.recruitment.firstRow : 0)
-      .filter(Boolean);
-    if (matches.length !== 1) throw new Error(`書類選考「${setting.roundName}」の設定行を一意に確認できません`);
-    rowNumber = matches[0];
-  }
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${sheetName}'!J${rowNumber}:L${rowNumber}`,
+    range: `'${sheetName}'!J${setting.rowNumber}:L${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -2035,22 +2024,9 @@ async function readInterviewSettings() {
 
 async function writeInterviewStatus(setting, status) {
   const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : interviewSettingsSheetName;
-  let rowNumber = setting.rowNumber;
-  if (setting.source === "unified") {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${sheetName}'!B${unifiedSettingsRanges.interview.firstRow}:B421`,
-      valueRenderOption: "UNFORMATTED_VALUE",
-    });
-    const matches = (response.data.values || [])
-      .map((row, index) => String(row[0] || "").trim() === setting.roundName ? index + unifiedSettingsRanges.interview.firstRow : 0)
-      .filter(Boolean);
-    if (matches.length !== 1) throw new Error(`面接「${setting.roundName}」の設定行を一意に確認できません`);
-    rowNumber = matches[0];
-  }
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${sheetName}'!L${rowNumber}:M${rowNumber}`,
+    range: `'${sheetName}'!L${setting.rowNumber}:M${setting.rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date())]] },
   });
@@ -2127,26 +2103,52 @@ function interviewRecordFromRow(row, rowNumber) {
   };
 }
 
+const shortReadCache = new Map();
+function invalidateShortRead(key) {
+  shortReadCache.delete(key);
+}
+async function cachedShortRead(key, ttlMs, loader) {
+  const now = Date.now();
+  const cached = shortReadCache.get(key);
+  if (cached?.value && cached.expiresAt > now) return cached.value;
+  if (cached?.promise) return cached.promise;
+  const promise = loader()
+    .then((value) => {
+      shortReadCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+      return value;
+    })
+    .catch((error) => {
+      shortReadCache.delete(key);
+      throw error;
+    });
+  shortReadCache.set(key, { promise, value: cached?.value, expiresAt: cached?.expiresAt || 0 });
+  return promise;
+}
+
 async function readInterviewRecords() {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${interviewManagementSheetName}'!A11:AD1000`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+  return cachedShortRead("interview-records", 3000, async () => {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${interviewManagementSheetName}'!A11:AD1000`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    return (response.data.values || [])
+      .map((row, index) => interviewRecordFromRow(row, index + 11))
+      .filter((record) => record.id);
   });
-  return (response.data.values || [])
-    .map((row, index) => interviewRecordFromRow(row, index + 11))
-    .filter((record) => record.id);
 }
 
 async function readStep1Applications() {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${applicationSheetName}'!A11:AD1000`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+  return cachedShortRead("step1-applications", 3000, async () => {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${applicationSheetName}'!A11:AD1000`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    return (response.data.values || [])
+      .map((row, index) => applicationFromSheetRow(row, index + 11))
+      .filter((application) => application.id);
   });
-  return (response.data.values || [])
-    .map((row, index) => applicationFromSheetRow(row, index + 11))
-    .filter((application) => application.id);
 }
 
 async function eligibleInterviewApplications(setting, search = "") {
@@ -2235,14 +2237,9 @@ async function reserveInterview(setting, application, interviewer, questions) {
   if (records.some((record) => record.applicationId === application.id && record.interviewStatus !== "CANCELLED")) {
     throw new Error("この応募者はすでに別の面接官が選択しています。");
   }
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${interviewManagementSheetName}'!A11:A1000`,
-    valueRenderOption: "UNFORMATTED_VALUE",
-  });
-  const ids = response.data.values || [];
+  const occupiedRows = new Set(records.map((record) => record.rowNumber));
   const emptyIndex = Array.from({ length: 990 }, (_, index) => index)
-    .find((index) => !String(ids[index]?.[0] || "").trim());
+    .find((index) => !occupiedRows.has(index + 11));
   if (emptyIndex === undefined) throw new Error("面接管理シートの保存行が不足しています。");
   const rowNumber = emptyIndex + 11;
   const id = nextInterviewId(application.id, records);
@@ -2287,6 +2284,7 @@ async function reserveInterview(setting, application, interviewer, questions) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [values] },
   });
+  invalidateShortRead("interview-records");
   return interviewRecordFromRow(values, rowNumber);
 }
 
@@ -2362,6 +2360,7 @@ async function updateInterviewRecord(record, valuesByColumn) {
     spreadsheetId,
     requestBody: { valueInputOption: "USER_ENTERED", data },
   });
+  invalidateShortRead("interview-records");
 }
 
 async function settingForInteraction(interaction) {
@@ -2936,7 +2935,10 @@ client.on("interactionCreate", async (interaction) => {
       await enqueueInterviewInteraction("面接キャンセル", interaction, () => handleInterviewCancelButton(interaction, interaction.customId.slice("iv:cancel:".length)));
     }
   } catch (error) {
-    const message = `面接処理エラー: ${error.message || error}`;
+    const quotaLimited = registerSheetsQuotaError(error);
+    const message = quotaLimited
+      ? `面接処理を一時待機しています。Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
+      : `面接処理エラー: ${error.message || error}`;
     console.error(message);
     if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -3116,10 +3118,14 @@ client.once("clientReady", async () => {
   } catch (error) {
     console.error("面接コマンド登録失敗:", error.message);
   }
-  const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
+  const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 30000), 30000);
   const initialPollDelay = Math.max(actionPollInterval, 60000);
   const pollSheetActions = async () => {
     await enqueue("シート操作・応募・退職処理", async () => {
+      if (Date.now() < sheetsQuotaBackoffUntil) {
+        console.log(`Google Sheets読込待機中: 残り約${sheetsBackoffRemainingSeconds()}秒`);
+        return;
+      }
       const jobs = [
         ["統合設定監査", auditUnifiedSettings],
         ["統合設定表示", applyUnifiedSettingsView],
@@ -3130,14 +3136,20 @@ client.once("clientReady", async () => {
         ["採用手続き", processOnboarding],
         ["退職手続き", processTerminations],
       ];
+      let completedWithoutQuotaError = true;
       for (const [label, job] of jobs) {
         try {
           await job();
         } catch (error) {
           const message = error.response?.data?.error?.message || error.message || String(error);
           console.error(`[${label}]`, message);
+          if (registerSheetsQuotaError(error)) {
+            completedWithoutQuotaError = false;
+            break;
+          }
         }
       }
+      if (completedWithoutQuotaError) sheetsQuotaBackoffLevel = 0;
     });
     setTimeout(pollSheetActions, actionPollInterval);
   };
