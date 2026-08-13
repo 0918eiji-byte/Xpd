@@ -72,6 +72,7 @@ const unifiedSettingsBlocks = new Map([
 let unifiedSettingsSheetId = null;
 let displayedSettingsCategory = "";
 let requestedSettingsCategory = "すべて";
+let lastSettingsViewCheckAt = 0;
 let unifiedSettingsHealthy = false;
 let lastUnifiedAuditAt = 0;
 let unifiedSettingsSnapshot = null;
@@ -221,6 +222,16 @@ async function unifiedRange(key) {
 
 async function applyUnifiedSettingsView() {
   if (!await unifiedSettingsReady()) return;
+  const now = Date.now();
+  if (now - lastSettingsViewCheckAt >= 10000) {
+    lastSettingsViewCheckAt = now;
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${unifiedSettingsSheetName}'!B3`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    requestedSettingsCategory = String(response.data.values?.[0]?.[0] || "すべて").trim();
+  }
   const requested = requestedSettingsCategory;
   const category = requested === "すべて" || unifiedSettingsBlocks.has(requested) ? requested : "すべて";
   if (category === displayedSettingsCategory) return;
@@ -251,6 +262,7 @@ const client = new Client({
 });
 
 let queue = Promise.resolve();
+let interviewQueue = Promise.resolve();
 const lastSynchronizedRanks = new Map();
 let sheetsQuotaBackoffUntil = 0;
 let sheetsQuotaBackoffLevel = 0;
@@ -280,6 +292,14 @@ function enqueue(label, work) {
     console.error(`[${label}]`, message);
   });
   return queue;
+}
+
+function enqueueInterview(label, work) {
+  interviewQueue = interviewQueue.then(work).catch((error) => {
+    const message = error.response?.data?.error?.message || error.message || error;
+    console.error(`[${label}]`, message);
+  });
+  return interviewQueue;
 }
 
 async function readRankMap() {
@@ -736,6 +756,10 @@ async function clearEmployeeRow(employeeSheet, rowNumber, context = null) {
   await sortEmployees(employeeSheet);
 }
 
+function logMemberSync(context, message) {
+  if (!context?.silent) console.log(message);
+}
+
 async function syncMember(member, context = null) {
   if (member.guild.id !== guildId || member.user.bot) return;
   const [rankMap, employeeSheet] = context
@@ -755,7 +779,7 @@ async function syncMember(member, context = null) {
   if (!hasAnyRole) {
     if (index >= 0) await clearEmployeeRow(employeeSheet, targetRow, context);
     lastSynchronizedRanks.delete(member.id);
-    console.log(`ロールなしのため名簿削除: ${member.displayName}`);
+    logMemberSync(context, `ロールなしのため名簿削除: ${member.displayName}`);
     return;
   }
 
@@ -767,7 +791,7 @@ async function syncMember(member, context = null) {
         "退職者ロールを検知したため名簿対象ロールを自動解除",
       );
       hasRosterRole = false;
-      console.log(`退職者の名簿対象ロールを自動解除: ${member.displayName} (${removedRoles.join(", ")})`);
+      logMemberSync(context, `退職者の名簿対象ロールを自動解除: ${member.displayName} (${removedRoles.join(", ")})`);
     }
     const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
     const previousRank = assessed.rankName || (index >= 0
@@ -786,14 +810,14 @@ async function syncMember(member, context = null) {
       );
     }
     lastSynchronizedRanks.set(member.id, "解雇");
-    console.log(`解雇者ロール検知: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
+    logMemberSync(context, `解雇者ロール検知: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
     return;
   }
 
   if (!hasRosterRole && assessed.rankName && index >= 0 && !hasExcludeRole) {
     await ensureRosterRole(member.guild, member, "階級ロールが残っているためPolice Officerを自動復元");
     hasRosterRole = true;
-    console.log(`Police Officerロール自動復元: ${member.displayName}`);
+    logMemberSync(context, `Police Officerロール自動復元: ${member.displayName}`);
   }
 
   const eligible = hasRosterRole && !hasExcludeRole;
@@ -802,7 +826,7 @@ async function syncMember(member, context = null) {
     if (index < 0) return;
     await clearEmployeeRow(employeeSheet, targetRow, context);
     lastSynchronizedRanks.delete(member.id);
-    console.log(`名簿対象外: ${member.displayName}`);
+    logMemberSync(context, `名簿対象外: ${member.displayName}`);
     return;
   }
 
@@ -823,7 +847,7 @@ async function syncMember(member, context = null) {
     );
   }
   lastSynchronizedRanks.set(member.id, appliedRank);
-  console.log(`同期完了: ${member.displayName} → ${appliedRank}`);
+  logMemberSync(context, `同期完了: ${member.displayName} → ${appliedRank}`);
 }
 
 async function consolidateEmployeeDuplicates() {
@@ -2104,6 +2128,30 @@ function interviewRecordFromRow(row, rowNumber) {
 }
 
 const shortReadCache = new Map();
+const interviewUiSessions = new Map();
+const interviewUiSessionTtlMs = 15 * 60 * 1000;
+
+function cacheInterviewSession(record) {
+  if (interviewUiSessions.size >= 500) {
+    const now = Date.now();
+    for (const [id, cached] of interviewUiSessions) {
+      if (cached.expiresAt <= now) interviewUiSessions.delete(id);
+    }
+  }
+  if (record?.id) interviewUiSessions.set(record.id, { record, expiresAt: Date.now() + interviewUiSessionTtlMs });
+  return record;
+}
+
+function cachedInterviewSession(id) {
+  const cached = interviewUiSessions.get(id);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    interviewUiSessions.delete(id);
+    return null;
+  }
+  cached.expiresAt = Date.now() + interviewUiSessionTtlMs;
+  return cached.record;
+}
 function invalidateShortRead(key) {
   shortReadCache.delete(key);
 }
@@ -2132,9 +2180,11 @@ async function readInterviewRecords() {
       range: `'${interviewManagementSheetName}'!A11:AD1000`,
       valueRenderOption: "UNFORMATTED_VALUE",
     });
-    return (response.data.values || [])
+    const records = (response.data.values || [])
       .map((row, index) => interviewRecordFromRow(row, index + 11))
       .filter((record) => record.id);
+    records.forEach(cacheInterviewSession);
+    return records;
   });
 }
 
@@ -2285,7 +2335,7 @@ async function reserveInterview(setting, application, interviewer, questions) {
     requestBody: { values: [values] },
   });
   invalidateShortRead("interview-records");
-  return interviewRecordFromRow(values, rowNumber);
+  return cacheInterviewSession(interviewRecordFromRow(values, rowNumber));
 }
 
 function canInterview(interaction, setting) {
@@ -2301,31 +2351,43 @@ function interviewSessionComponents(record, questionIndex = 0) {
   const safeIndex = Math.max(0, Math.min(questionIndex, Math.max(questions.length - 1, 0)));
   const answers = interviewAnswers(record);
   const current = questions[safeIndex];
-  return [new ActionRowBuilder().addComponents(
+  const jump = new StringSelectMenuBuilder()
+    .setCustomId(`iv:jump:${record.id}`)
+    .setPlaceholder(`質問を選択（${safeIndex + 1}/${questions.length}）`)
+    .addOptions(questions.slice(0, 24).map((question, index) => new StringSelectMenuOptionBuilder()
+      .setLabel(truncateDiscord(`${answers[question.id] ? "✅" : question.required ? "必須" : "任意"} Q${index + 1} ${question.text}`, 100))
+      .setValue(String(index))
+      .setDefault(index === safeIndex)));
+  return [
+    new ActionRowBuilder().addComponents(jump),
+    new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`iv:page:${record.id}:${Math.max(safeIndex - 1, 0)}`)
-      .setLabel("前の質問")
+      .setLabel("← 前へ")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(safeIndex === 0),
     new ButtonBuilder()
       .setCustomId(`iv:q:${record.id}:${safeIndex}`)
-      .setLabel(current && answers[current.id] ? "この回答を修正" : "この質問に回答")
+      .setLabel(current && answers[current.id] ? "回答を修正" : "回答する")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`iv:page:${record.id}:${Math.min(safeIndex + 1, Math.max(questions.length - 1, 0))}`)
-      .setLabel("次の質問")
+      .setLabel("次へ →")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(safeIndex >= questions.length - 1),
+    ),
+    new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`iv:vote:${record.id}`)
-      .setLabel("面接を完了して投票開始")
+      .setLabel("回答完了・投票へ")
       .setStyle(ButtonStyle.Success)
       .setDisabled(!interviewReady(record)),
     new ButtonBuilder()
       .setCustomId(`iv:cancel:${record.id}`)
-      .setLabel("面接をキャンセル")
+      .setLabel("面接を中止")
       .setStyle(ButtonStyle.Danger),
-  )];
+    ),
+  ];
 }
 
 function interviewSessionEmbed(record, questionIndex = 0) {
@@ -2333,21 +2395,28 @@ function interviewSessionEmbed(record, questionIndex = 0) {
   const answers = interviewAnswers(record);
   const safeIndex = Math.max(0, Math.min(questionIndex, Math.max(questions.length - 1, 0)));
   const answered = questions.filter((question) => String(answers[question.id] || "").trim()).length;
-  const valueBudget = Math.max(140, Math.min(900, Math.floor(4700 / Math.max(questions.length, 1))));
-  const fields = questions.slice(0, 24).map((question, index) => ({
-    name: `${index === safeIndex ? "▶" : answers[question.id] ? "✅" : "⬜"} Q${index + 1}${question.required ? "【必須】" : "【任意】"}`,
-    value: truncateDiscord(`${question.text}${question.note ? `\n補足: ${question.note}` : ""}${answers[question.id] ? `\n回答: ${answers[question.id]}` : ""}`, valueBudget),
-  }));
+  const required = questions.filter((question) => question.required);
+  const requiredAnswered = required.filter((question) => String(answers[question.id] || "").trim()).length;
+  const current = questions[safeIndex];
+  const questionList = questions.slice(0, 24).map((question, index) =>
+    `${index === safeIndex ? "▶" : answers[question.id] ? "✅" : question.required ? "🔸" : "▫️"} Q${index + 1} ${truncateDiscord(question.text, 34)}`
+  ).join("\n");
+  const currentValue = current
+    ? `${current.text}${current.note ? `\n\n補足: ${current.note}` : ""}${answers[current.id] ? `\n\n**保存済み回答**\n${answers[current.id]}` : "\n\n*未回答*"}`
+    : "質問がありません。";
   return new EmbedBuilder()
     .setColor(interviewReady(record) ? 0x16a34a : 0x2563eb)
     .setTitle(truncateDiscord(`STEP2 面接進行｜${record.applicantName || record.applicationId}`, 256))
-    .setDescription(`応募ID: **${record.applicationId}**\n面接ID: **${record.id}**\n回答状況: **${answered}/${questions.length}問**`)
-    .addFields(fields)
-    .setFooter({ text: "質問は常時表示されます。前後ボタンで選び、1問ずつ回答してください。" });
+    .setDescription(`応募ID: **${record.applicationId}**　面接ID: **${record.id}**\n進捗: **必須 ${requiredAnswered}/${required.length}｜全体 ${answered}/${questions.length}**`)
+    .addFields(
+      { name: `現在の質問｜Q${safeIndex + 1}${current?.required ? "【必須】" : "【任意】"}`, value: truncateDiscord(currentValue, 1024) },
+      { name: "質問一覧", value: truncateDiscord(questionList, 1024) || "質問なし" },
+    )
+    .setFooter({ text: interviewReady(record) ? "必須回答が完了しました。投票へ進めます。" : "質問を選び、1問ずつ回答してください。回答は自動保存されます。" });
 }
 
 async function interviewRecordById(id) {
-  return (await readInterviewRecords()).find((record) => record.id === id) || null;
+  return cachedInterviewSession(id) || (await readInterviewRecords()).find((record) => record.id === id) || null;
 }
 
 async function updateInterviewRecord(record, valuesByColumn) {
@@ -2361,6 +2430,11 @@ async function updateInterviewRecord(record, valuesByColumn) {
     requestBody: { valueInputOption: "USER_ENTERED", data },
   });
   invalidateShortRead("interview-records");
+  Object.entries(valuesByColumn).forEach(([column, value]) => {
+    const fields = { M: "answerMemo", N: "interviewStatus", O: "pollStatus", X: "processResult" };
+    if (fields[column]) record[fields[column]] = value;
+  });
+  cacheInterviewSession(record);
 }
 
 async function settingForInteraction(interaction) {
@@ -2439,6 +2513,10 @@ async function handleInterviewPageButton(interaction, interviewId, questionIndex
   if (!record || record.interviewerId !== interaction.user.id) throw new Error("この面接を操作できません。");
   if (!["IN_PROGRESS", "READY"].includes(record.interviewStatus)) throw new Error("この面接はすでに投票段階へ進んでいます。");
   await interaction.editReply({ embeds: [interviewSessionEmbed(record, questionIndex)], components: interviewSessionComponents(record, questionIndex) });
+}
+
+async function handleInterviewJump(interaction, interviewId, questionIndex) {
+  return handleInterviewPageButton(interaction, interviewId, questionIndex);
 }
 
 async function handleInterviewQuestionButton(interaction, interviewId, questionIndex) {
@@ -2881,14 +2959,21 @@ async function registerInterviewCommand(guild) {
 }
 
 async function enqueueInterviewInteraction(label, interaction, work) {
-  await enqueue(label, async () => {
+  await enqueueInterview(label, async () => {
     try {
       await work();
     } catch (error) {
-      const message = `面接処理エラー: ${error.message || error}`;
+      const quotaLimited = registerSheetsQuotaError(error);
+      const raw = String(error.message || error);
+      const message = quotaLimited
+        ? `Google Sheetsが一時的に混雑しています。約${sheetsBackoffRemainingSeconds()}秒後に自動復帰します。入力内容は消さず、同じ操作をもう一度行ってください。`
+        : /すでに別の面接官|現在面接対象ではありません/.test(raw)
+          ? `${raw}\n/mensetu で最新の候補一覧を開き直してください。`
+          : `面接処理エラー: ${raw}\n画面を閉じずに再試行してください。`;
       console.error(message);
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
+        await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral }).catch(() =>
+          interaction.editReply({ content: message }).catch(() => {}));
       } else {
         await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
@@ -2911,7 +2996,13 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith("iv:page:")) {
       const [, , interviewId, questionIndex] = interaction.customId.split(":");
       await interaction.deferUpdate();
-      await enqueueInterviewInteraction("面接質問切替", interaction, () => handleInterviewPageButton(interaction, interviewId, Number(questionIndex)));
+      await handleInterviewPageButton(interaction, interviewId, Number(questionIndex));
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("iv:jump:")) {
+      const interviewId = interaction.customId.slice("iv:jump:".length);
+      await interaction.deferUpdate();
+      await handleInterviewJump(interaction, interviewId, Number(interaction.values[0]));
       return;
     }
     if (interaction.isButton() && interaction.customId.startsWith("iv:q:")) {
@@ -3075,7 +3166,7 @@ async function fullSync() {
   }
   await consolidateEmployeeDuplicates();
   const employeeSheet = await readEmployees();
-  const context = { rankMap, employeeSheet, pendingData: [], pendingClearRanges: [] };
+  const context = { rankMap, employeeSheet, pendingData: [], pendingClearRanges: [], silent: true };
   for (const member of members.values()) await syncMember(member, context);
   if (context.pendingClearRanges.length) {
     await sheets.spreadsheets.values.batchClear({
@@ -3128,7 +3219,6 @@ client.once("clientReady", async () => {
       }
       const jobs = [
         ["統合設定監査", auditUnifiedSettings],
-        ["統合設定表示", applyUnifiedSettingsView],
         ["従業員操作", processSheetActions],
         ["ボーナス配布", processBonusDistribution],
         ["書類選考", processRecruitmentApplications],
@@ -3153,8 +3243,21 @@ client.once("clientReady", async () => {
     });
     setTimeout(pollSheetActions, actionPollInterval);
   };
+  const pollSettingsView = async () => {
+    if (Date.now() >= sheetsQuotaBackoffUntil) {
+      try {
+        await applyUnifiedSettingsView();
+      } catch (error) {
+        if (!registerSheetsQuotaError(error)) console.error("[統合設定表示]", error.message || error);
+      }
+    }
+    setTimeout(pollSettingsView, 10000);
+  };
   enqueue("起動時全件同期", fullSync)
-    .finally(() => setTimeout(pollSheetActions, initialPollDelay));
+    .finally(() => {
+      setTimeout(pollSheetActions, initialPollDelay);
+      setTimeout(pollSettingsView, 10000);
+    });
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
   console.log(`起動後の初回シート確認: ${initialPollDelay}ms後`);
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
