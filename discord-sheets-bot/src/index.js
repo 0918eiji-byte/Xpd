@@ -52,6 +52,219 @@ const rosterRoleIds = new Set(
 const excludeRoleIds = new Set(
   (process.env.EXCLUDE_ROLE_IDS || "").split(",").map((id) => id.trim()).filter(Boolean),
 );
+const unifiedSettingsSheetName = "設定";
+const unifiedSettingsSchema = "v2:READY";
+const unifiedSettingsRanges = {
+  rank: { range: "A10:F109", firstRow: 10 },
+  bonus: { range: "A114:C213", firstRow: 114 },
+  recruitment: { range: "A218:N317", firstRow: 218 },
+  interview: { range: "A322:P421", firstRow: 322 },
+  questions: { range: "A426:G1425", firstRow: 426 },
+};
+const unifiedSettingsBlocks = new Map([
+  ["ランク", [7, 109]],
+  ["ボーナス回", [111, 213]],
+  ["書類選考", [215, 317]],
+  ["面接", [319, 421]],
+  ["面接質問", [423, 1425]],
+  ["連携", [1427, 1529]],
+]);
+let unifiedSettingsSheetId = null;
+let displayedSettingsCategory = "";
+let unifiedReadyCache = { checkedAt: 0, ready: false };
+let unifiedSettingsHealthy = false;
+let lastUnifiedAuditAt = 0;
+let unifiedSettingsSnapshot = null;
+
+async function unifiedSettingsReady(force = false) {
+  const now = Date.now();
+  if (!force && now - unifiedReadyCache.checkedAt < 5000) return unifiedReadyCache.ready;
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${unifiedSettingsSheetName}'!K3`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    const ready = String(response.data.values?.[0]?.[0] || "").trim() === unifiedSettingsSchema
+      && unifiedSettingsHealthy;
+    unifiedReadyCache = { checkedAt: now, ready };
+    return ready;
+  } catch (error) {
+    if (error.code === 400 || /Unable to parse range|not found/i.test(error.message || "")) {
+      unifiedReadyCache = { checkedAt: now, ready: false };
+      return false;
+    }
+    throw error;
+  }
+}
+
+function normalizedId(value) {
+  return String(value || "").replace(/^'/, "").trim();
+}
+
+function duplicateValues(values) {
+  const seen = new Set();
+  const duplicates = new Set();
+  for (const value of values.filter(Boolean)) {
+    if (seen.has(value)) duplicates.add(value);
+    seen.add(value);
+  }
+  return [...duplicates];
+}
+
+async function auditUnifiedSettings(force = false) {
+  const now = Date.now();
+  if (!force && now - lastUnifiedAuditAt < 30000) return unifiedSettingsHealthy;
+  lastUnifiedAuditAt = now;
+  let schema = "";
+  try {
+    const response = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges: [
+        `'${unifiedSettingsSheetName}'!K3`,
+        `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.rank.range}`,
+        `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.bonus.range}`,
+        `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.recruitment.range}`,
+        `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.interview.range}`,
+        `'${unifiedSettingsSheetName}'!${unifiedSettingsRanges.questions.range}`,
+      ],
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    const ranges = response.data.valueRanges || [];
+    schema = String(ranges[0]?.values?.[0]?.[0] || "").trim();
+    if (schema !== unifiedSettingsSchema) return false;
+    const [rankRows, bonusRows, recruitmentRows, interviewRows, questionRows] = ranges.slice(1).map((range) => range.values || []);
+    const errors = [];
+    const snowflake = /^\d{17,20}$/;
+    const activeRanks = rankRows.filter((row) => String(row[5] || "").trim() === "はい");
+    for (const row of activeRanks) {
+      if (!String(row[1] || "").trim() || !snowflake.test(normalizedId(row[2]))) errors.push("ランク名またはロールIDが不正");
+      if (!Number.isFinite(Number(row[0])) || !Number.isFinite(Number(row[4]))) errors.push("ランク優先度またはボーナス係数が不正");
+    }
+    if (duplicateValues(activeRanks.map((row) => String(row[1] || "").trim())).length) errors.push("ランク名が重複");
+    if (duplicateValues(activeRanks.map((row) => normalizedId(row[2]))).length) errors.push("ランクロールIDが重複");
+    if (duplicateValues(activeRanks.map((row) => String(row[0] || "").trim())).length) errors.push("ランク優先度が重複");
+    for (const requiredRank of ["体験", "解雇者"]) {
+      if (activeRanks.filter((row) => String(row[1] || "").trim() === requiredRank).length !== 1) errors.push(`${requiredRank}ランクは有効な1件が必要`);
+    }
+    const rounds = [];
+    for (const row of recruitmentRows.filter((item) => String(item[0] || "").trim() === "はい")) {
+      const round = String(row[1] || "").trim();
+      rounds.push(round);
+      if (!round || !String(row[2] || "").trim()) errors.push("書類選考の募集回または回答URLが未設定");
+      else {
+        try { extractSpreadsheetId(String(row[2])); } catch { errors.push("書類選考の回答スプレッドシートURLが不正"); }
+      }
+      for (const [value, label] of [[row[3], "投票"], [row[7], "合格発表"], [row[13], "書類合格ロール"]]) {
+        if (normalizedId(value) && !snowflake.test(normalizedId(value))) errors.push(`書類選考の${label}IDが不正`);
+      }
+      if (!(Number(row[5]) >= 1 && Number(row[5]) <= 168)) errors.push("書類選考の期限は1～168時間");
+      if (!(Number(row[6]) >= 1 && Number(row[6]) <= 1000)) errors.push("書類選考の締切票数は1～1000");
+    }
+    if (duplicateValues(rounds).length) errors.push("書類選考の募集回が重複");
+    const interviewRounds = [];
+    for (const row of interviewRows.filter((item) => String(item[0] || "").trim() === "はい")) {
+      const round = String(row[1] || "").trim();
+      interviewRounds.push(round);
+      if (!round || !String(row[10] || "").trim()) errors.push("面接の募集回または質問セットが未設定");
+      for (const [value, label] of [[row[2], "実行チャンネル"], [row[3], "面接官ロール"], [row[4], "投票チャンネル"], [row[8], "合格発表チャンネル"], [row[15], "面接合格ロール"]]) {
+        if (normalizedId(value) && !snowflake.test(normalizedId(value))) errors.push(`面接の${label}IDが不正`);
+      }
+      if (!(Number(row[6]) >= 1 && Number(row[6]) <= 168)) errors.push("面接の期限は1～168時間");
+      if (!(Number(row[7]) >= 1 && Number(row[7]) <= 1000)) errors.push("面接の締切票数は1～1000");
+    }
+    if (duplicateValues(interviewRounds).length) errors.push("面接の募集回が重複");
+    const activeQuestions = questionRows.filter((row) => String(row[0] || "").trim() === "はい");
+    if (duplicateValues(activeQuestions.map((row) => `${String(row[1] || "").trim()}:${String(row[2] || "").trim()}`)).length) errors.push("質問IDが質問セット内で重複");
+    const questionSets = new Map();
+    for (const row of activeQuestions) {
+      const setName = String(row[1] || "").trim();
+      if (!setName || !String(row[2] || "").trim() || !String(row[4] || "").trim()) errors.push("面接質問の必須項目が未設定");
+      const list = questionSets.get(setName) || [];
+      list.push(row);
+      questionSets.set(setName, list);
+    }
+    for (const [setName, rows] of questionSets) {
+      if (rows.length > 24) errors.push(`${setName}は24問以下にしてください`);
+      if (!rows.some((row) => String(row[6] || "").trim() !== "いいえ")) errors.push(`${setName}に必須質問が必要`);
+      if (duplicateValues(rows.map((row) => String(row[3] || "").trim())).length) errors.push(`${setName}の表示順が重複`);
+    }
+    for (const row of interviewRows.filter((item) => String(item[0] || "").trim() === "はい")) {
+      const setName = String(row[10] || "").trim();
+      if (!questionSets.has(setName)) errors.push(`面接で参照する質問セット「${setName}」がありません`);
+    }
+    const configuredBonusRows = bonusRows.filter((row) => String(row[0] || "").trim());
+    if (duplicateValues(configuredBonusRows.map((row) => String(row[0] || "").trim())).length) errors.push("ボーナス支給回が重複");
+    if (configuredBonusRows.some((row) => !Number.isFinite(Number(row[1])) || Number(row[1]) < 0)) errors.push("ボーナスのプール開始額が不正");
+    const uniqueErrors = [...new Set(errors)];
+    unifiedSettingsHealthy = uniqueErrors.length === 0;
+    if (unifiedSettingsHealthy) {
+      unifiedSettingsSnapshot = {
+        rank: rankRows.map((row) => [...row]),
+        bonus: bonusRows.map((row) => [...row]),
+        recruitment: recruitmentRows.map((row) => [...row]),
+        interview: interviewRows.map((row) => [...row]),
+        questions: questionRows.map((row) => [...row]),
+        auditedAt: now,
+      };
+    }
+    unifiedReadyCache = { checkedAt: 0, ready: false };
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: [
+          { range: `'${unifiedSettingsSheetName}'!E3`, values: [[uniqueErrors.length ? `要確認: ${uniqueErrors.slice(0, 3).join(" / ")}` : "正常"]] },
+          { range: `'${unifiedSettingsSheetName}'!H3`, values: [[sheetDateTime(new Date())]] },
+        ],
+      },
+    });
+    return unifiedSettingsHealthy;
+  } catch (error) {
+    if (!schema && (error.code === 400 || /Unable to parse range|not found/i.test(error.message || ""))) return false;
+    throw error;
+  }
+}
+
+async function unifiedRange(key) {
+  if (!await unifiedSettingsReady()) return null;
+  const block = unifiedSettingsRanges[key];
+  const rows = unifiedSettingsSnapshot?.[key];
+  if (!rows) return null;
+  return { rows: rows.map((row) => [...row]), firstRow: block.firstRow, source: "unified" };
+}
+
+async function applyUnifiedSettingsView() {
+  if (!await unifiedSettingsReady()) return;
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${unifiedSettingsSheetName}'!B3`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const requested = String(response.data.values?.[0]?.[0] || "すべて").trim();
+  const category = requested === "すべて" || unifiedSettingsBlocks.has(requested) ? requested : "すべて";
+  if (category === displayedSettingsCategory) return;
+  if (unifiedSettingsSheetId === null) {
+    const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: "sheets.properties(sheetId,title)" });
+    unifiedSettingsSheetId = metadata.data.sheets
+      ?.find((sheet) => sheet.properties?.title === unifiedSettingsSheetName)?.properties?.sheetId;
+  }
+  if (unifiedSettingsSheetId === undefined || unifiedSettingsSheetId === null) return;
+  const requests = [...unifiedSettingsBlocks.entries()].map(([name, [startIndex, endIndex]]) => ({
+    updateDimensionProperties: {
+      range: {
+        sheetId: unifiedSettingsSheetId,
+        dimension: "ROWS",
+        startIndex,
+        endIndex,
+      },
+      properties: { hiddenByUser: category !== "すべて" && category !== name },
+      fields: "hiddenByUser",
+    },
+  }));
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+  displayedSettingsCategory = category;
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
@@ -68,15 +281,16 @@ function enqueue(label, work) {
 }
 
 async function readRankMap() {
-  const response = await sheets.spreadsheets.values.get({
+  const unified = await unifiedRange("rank");
+  const response = unified || await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: "'ランク設定'!A3:F1000",
   });
   const map = new Map();
-  for (const row of response.data.values || []) {
+  for (const row of unified?.rows || response.data.values || []) {
     const priority = Number(row[0]);
     const rankName = String(row[1] || "").trim();
-    const roleId = String(row[2] || "").trim();
+    const roleId = normalizedId(row[2]);
     const roleName = String(row[3] || rankName).trim();
     const enabled = String(row[5] || "") === "はい";
     if (enabled && roleId && rankName) map.set(roleId, { roleId, priority, rankName, roleName });
@@ -344,7 +558,7 @@ function employeeFormulas(employeeSheet, rowNumber) {
   const id = ref(employeeSheet, "社員ID", rowNumber);
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
   return {
-    [bonusFactorHeader]: `=IF(${id}="","",IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0))`,
+    [bonusFactorHeader]: `=IF(${id}="","",IF('設定'!$K$3="v2:READY",IFNA(XLOOKUP(${appliedRank},'設定'!$B$10:$B$109,'設定'!$E$10:$E$109),0),IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0)))`,
   };
 }
 
@@ -817,25 +1031,28 @@ async function writeBonusTop(data) {
 }
 
 async function saveBonusRoundSetting(roundName, poolAmount, loadedAt) {
-  const response = await sheets.spreadsheets.values.get({
+  const unified = await unifiedRange("bonus");
+  const response = unified || await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `'${bonusRoundSettingsSheetName}'!A2:C100`,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
-  const rows = response.data.values || [];
+  const rows = unified?.rows || response.data.values || [];
   let index = rows.findIndex((row) => String(row[0] || "").trim() === roundName);
   if (index < 0) index = rows.findIndex((row) => !String(row[0] || "").trim());
-  if (index < 0) index = rows.length;
+  if (index < 0 || (unified && index >= 100)) throw new Error("ボーナス回設定が上限100件に達しています");
+  const rowNumber = index + (unified?.firstRow || 2);
+  const sheetName = unified ? unifiedSettingsSheetName : bonusRoundSettingsSheetName;
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${bonusRoundSettingsSheetName}'!A${index + 2}:C${index + 2}`,
+    range: `'${sheetName}'!A${rowNumber}:C${rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[roundName, poolAmount, sheetDateTime(loadedAt)]] },
   });
 }
 
 function bonusLedgerRow(rowNumber, roundName, employee, loadedAt, existingRow = null) {
-  const basicPay = `=IF(B${rowNumber}="","",IF(SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000)=0,0,ROUNDDOWN(IFNA(XLOOKUP($L${rowNumber},'${bonusRoundSettingsSheetName}'!$A$2:$A$100,'${bonusRoundSettingsSheetName}'!$B$2:$B$100),0)*E${rowNumber}/SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000),-7)))`;
+  const basicPay = `=IF(B${rowNumber}="","",IF(SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000)=0,0,ROUNDDOWN(IF('設定'!$K$3="v2:READY",IFNA(XLOOKUP($L${rowNumber},'設定'!$A$114:$A$213,'設定'!$B$114:$B$213),0),IFNA(XLOOKUP($L${rowNumber},'${bonusRoundSettingsSheetName}'!$A$2:$A$100,'${bonusRoundSettingsSheetName}'!$B$2:$B$100),0))*E${rowNumber}/SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000),-7)))`;
   return [
     sheetDateTime(loadedAt).slice(0, 10),
     employee.employeeId,
@@ -1032,11 +1249,12 @@ async function resolveApplicantDiscordUserId(value) {
   return findMember(members)?.id || "";
 }
 
-function recruitmentSettingFromRow(row, index) {
+function recruitmentSettingFromRow(row, index, firstRow = 4, source = "legacy") {
   const requestedDuration = Number(row[5]);
   const requestedVoteLimit = Number(row[6]);
   return {
-    rowNumber: index + 4,
+    rowNumber: index + firstRow,
+    source,
     enabled: String(row[0] || "").trim() === "はい",
     roundName: String(row[1] || "").trim(),
     responseSpreadsheetUrl: String(row[2] || "").trim(),
@@ -1069,6 +1287,12 @@ function sheetCellInputValue(cell) {
 }
 
 async function readRecruitmentSettings() {
+  const unified = await unifiedRange("recruitment");
+  if (unified) {
+    return unified.rows
+      .map((row, index) => recruitmentSettingFromRow(row, index, unified.firstRow, unified.source))
+      .filter((setting) => setting.roundName);
+  }
   const response = await sheets.spreadsheets.get({
     spreadsheetId,
     ranges: [`'${recruitmentSettingsSheetName}'!A4:N100`],
@@ -1083,9 +1307,23 @@ async function readRecruitmentSettings() {
 }
 
 async function writeRecruitmentStatus(setting, status) {
+  const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : recruitmentSettingsSheetName;
+  let rowNumber = setting.rowNumber;
+  if (setting.source === "unified") {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${sheetName}'!B${unifiedSettingsRanges.recruitment.firstRow}:B317`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    const matches = (response.data.values || [])
+      .map((row, index) => String(row[0] || "").trim() === setting.roundName ? index + unifiedSettingsRanges.recruitment.firstRow : 0)
+      .filter(Boolean);
+    if (matches.length !== 1) throw new Error(`書類選考「${setting.roundName}」の設定行を一意に確認できません`);
+    rowNumber = matches[0];
+  }
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${recruitmentSettingsSheetName}'!J${setting.rowNumber}:L${setting.rowNumber}`,
+    range: `'${sheetName}'!J${rowNumber}:L${rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
@@ -1753,11 +1991,12 @@ async function processRecruitmentApplications() {
   }
 }
 
-function interviewSettingFromRow(row, index) {
+function interviewSettingFromRow(row, index, firstRow = 4, source = "legacy") {
   const requestedDuration = Number(row[6]);
   const requestedVoteLimit = Number(row[7]);
   return {
-    rowNumber: index + 4,
+    rowNumber: index + firstRow,
+    source,
     enabled: String(row[0] || "").trim() === "はい",
     roundName: String(row[1] || "").trim(),
     commandChannelId: String(row[2] || "").replace(/^'/, "").trim(),
@@ -1778,6 +2017,12 @@ function interviewSettingFromRow(row, index) {
 }
 
 async function readInterviewSettings() {
+  const unified = await unifiedRange("interview");
+  if (unified) {
+    return unified.rows
+      .map((row, index) => interviewSettingFromRow(row, index, unified.firstRow, unified.source))
+      .filter((setting) => setting.enabled);
+  }
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `'${interviewSettingsSheetName}'!A4:P100`,
@@ -1789,15 +2034,44 @@ async function readInterviewSettings() {
 }
 
 async function writeInterviewStatus(setting, status) {
+  const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : interviewSettingsSheetName;
+  let rowNumber = setting.rowNumber;
+  if (setting.source === "unified") {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${sheetName}'!B${unifiedSettingsRanges.interview.firstRow}:B421`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    const matches = (response.data.values || [])
+      .map((row, index) => String(row[0] || "").trim() === setting.roundName ? index + unifiedSettingsRanges.interview.firstRow : 0)
+      .filter(Boolean);
+    if (matches.length !== 1) throw new Error(`面接「${setting.roundName}」の設定行を一意に確認できません`);
+    rowNumber = matches[0];
+  }
   await sheets.spreadsheets.values.update({
     spreadsheetId,
-    range: `'${interviewSettingsSheetName}'!L${setting.rowNumber}:M${setting.rowNumber}`,
+    range: `'${sheetName}'!L${rowNumber}:M${rowNumber}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date())]] },
   });
 }
 
 async function readInterviewQuestions(questionSet) {
+  const unified = await unifiedRange("questions");
+  if (unified) {
+    return unified.rows
+      .map((row) => ({
+        enabled: String(row[0] || "").trim() === "はい",
+        questionSet: String(row[1] || "").trim(),
+        id: String(row[2] || "").trim(),
+        order: Number(row[3]) || 9999,
+        text: String(row[4] || "").trim(),
+        note: String(row[5] || "").trim(),
+        required: String(row[6] || "").trim() !== "いいえ",
+      }))
+      .filter((question) => question.enabled && question.questionSet === questionSet && question.text)
+      .sort((a, b) => a.order - b.order);
+  }
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `'${interviewQuestionsSheetName}'!A4:G1000`,
@@ -2832,6 +3106,11 @@ async function markRemoved(member) {
 client.once("clientReady", async () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
   try {
+    await auditUnifiedSettings(true);
+  } catch (error) {
+    console.error("統合設定の起動時監査失敗:", error.message);
+  }
+  try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
     await registerInterviewCommand(guild);
   } catch (error) {
@@ -2841,12 +3120,24 @@ client.once("clientReady", async () => {
   const initialPollDelay = Math.max(actionPollInterval, 60000);
   const pollSheetActions = async () => {
     await enqueue("シート操作・応募・退職処理", async () => {
-      await processSheetActions();
-      await processBonusDistribution();
-      await processRecruitmentApplications();
-      await processInterviewPolls();
-      await processOnboarding();
-      await processTerminations();
+      const jobs = [
+        ["統合設定監査", auditUnifiedSettings],
+        ["統合設定表示", applyUnifiedSettingsView],
+        ["従業員操作", processSheetActions],
+        ["ボーナス配布", processBonusDistribution],
+        ["書類選考", processRecruitmentApplications],
+        ["面接", processInterviewPolls],
+        ["採用手続き", processOnboarding],
+        ["退職手続き", processTerminations],
+      ];
+      for (const [label, job] of jobs) {
+        try {
+          await job();
+        } catch (error) {
+          const message = error.response?.data?.error?.message || error.message || String(error);
+          console.error(`[${label}]`, message);
+        }
+      }
     });
     setTimeout(pollSheetActions, actionPollInterval);
   };
