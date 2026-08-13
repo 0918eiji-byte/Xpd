@@ -1526,6 +1526,7 @@ async function staffProfile(discordId) {
     roles: String(value("Discordロール") || ""),
     rank: String(value("適用ランク") || "？？？？"),
     factor: value(bonusFactorHeader),
+    report: String(value("報告欄") || ""),
     operationResult: String(value("操作結果") || ""),
     operationAt: value("操作日時"),
   };
@@ -1545,6 +1546,7 @@ function staffProfileEmbed(profile, member) {
       { name: "ユーザー名", value: member.user.username, inline: true },
       { name: "ランク係数", value: String(profile.factor ?? 0), inline: true },
       { name: "階級ロール", value: truncateDiscord(profile.roles || "設定なし", 1024) },
+      { name: "報告欄", value: truncateDiscord(profile.report || "報告なし", 1024) },
       { name: "最終操作", value: truncateDiscord([profile.operationResult, profile.operationAt].filter(Boolean).join("｜") || "履歴なし", 1024) },
     )
     .setFooter({ text: "従業員名簿の現在値を表示しています" })
