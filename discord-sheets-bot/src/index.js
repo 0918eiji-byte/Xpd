@@ -1,5 +1,20 @@
 import http from "node:http";
-import { Client, EmbedBuilder, GatewayIntentBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  MessageFlags,
+  ModalBuilder,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} from "discord.js";
 import { google } from "googleapis";
 
 const required = [
@@ -212,6 +227,11 @@ const applicationSheetId = 2081134610;
 let displayedApplicationRound = "";
 let lastRecruitmentPollAt = 0;
 const recruitmentPollIntervalMs = Math.max(Number(process.env.RECRUITMENT_POLL_INTERVAL_MS || 60000), 30000);
+const interviewSettingsSheetName = "面接設定";
+const interviewQuestionsSheetName = "面接質問";
+const interviewManagementSheetName = "面接管理";
+let lastInterviewPollAt = 0;
+const interviewPollIntervalMs = Math.max(Number(process.env.INTERVIEW_POLL_INTERVAL_MS || 60000), 30000);
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -1587,6 +1607,594 @@ async function processRecruitmentApplications() {
   }
 }
 
+function interviewSettingFromRow(row, index) {
+  const requestedDuration = Number(row[6]);
+  const requestedVoteLimit = Number(row[7]);
+  return {
+    rowNumber: index + 4,
+    enabled: String(row[0] || "").trim() === "はい",
+    roundName: String(row[1] || "").trim(),
+    commandChannelId: String(row[2] || "").replace(/^'/, "").trim(),
+    interviewerRoleId: String(row[3] || "").replace(/^'/, "").trim(),
+    pollChannelId: String(row[4] || "").replace(/^'/, "").trim(),
+    pollMessage: String(row[5] || "").trim() || "面接内容を確認し、合格または不合格へ投票してください。",
+    pollDurationHours: Number.isFinite(requestedDuration) && requestedDuration >= 1 && requestedDuration <= 168
+      ? Math.floor(requestedDuration)
+      : 24,
+    pollVoteLimit: Number.isFinite(requestedVoteLimit) && requestedVoteLimit >= 1 && requestedVoteLimit <= 1000
+      ? Math.floor(requestedVoteLimit)
+      : 5,
+    passChannelId: String(row[8] || "").replace(/^'/, "").trim(),
+    passMessage: String(row[9] || "").trim() || "面接選考の合格が決定しました。今後の案内をご確認ください。",
+    questionSet: String(row[10] || "").trim() || "標準面接",
+  };
+}
+
+async function readInterviewSettings() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${interviewSettingsSheetName}'!A4:M100`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  return (response.data.values || [])
+    .map(interviewSettingFromRow)
+    .filter((setting) => setting.enabled);
+}
+
+async function writeInterviewStatus(setting, status) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${interviewSettingsSheetName}'!L${setting.rowNumber}:M${setting.rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[status, sheetDateTime(new Date())]] },
+  });
+}
+
+async function readInterviewQuestions(questionSet) {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${interviewQuestionsSheetName}'!A4:G1000`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  return (response.data.values || [])
+    .map((row) => ({
+      enabled: String(row[0] || "").trim() === "はい",
+      questionSet: String(row[1] || "").trim(),
+      id: String(row[2] || "").trim(),
+      order: Number(row[3]) || 9999,
+      text: String(row[4] || "").trim(),
+      note: String(row[5] || "").trim(),
+      required: String(row[6] || "").trim() !== "いいえ",
+    }))
+    .filter((question) => question.enabled && question.questionSet === questionSet && question.text)
+    .sort((a, b) => a.order - b.order);
+}
+
+function interviewRecordFromRow(row, rowNumber) {
+  return {
+    rowNumber,
+    id: String(row[0] || "").trim(),
+    applicationId: String(row[1] || "").trim(),
+    roundName: String(row[2] || "").trim(),
+    applicantName: String(row[3] || "").trim(),
+    applicantDiscordName: String(row[4] || "").trim(),
+    applicantDiscordId: String(row[5] || "").replace(/^'/, "").trim(),
+    interviewerId: String(row[6] || "").replace(/^'/, "").trim(),
+    interviewerName: String(row[7] || "").trim(),
+    startedAt: row[8] || "",
+    completedAt: row[9] || "",
+    questionSet: String(row[10] || "").trim(),
+    questionSnapshot: String(row[11] || "").trim(),
+    answerMemo: String(row[12] || "").trim(),
+    interviewStatus: String(row[13] || "").trim(),
+    pollStatus: String(row[14] || "").trim(),
+    passVotes: Number(row[15]) || 0,
+    failVotes: Number(row[16]) || 0,
+    totalVotes: Number(row[17]) || 0,
+    verdict: String(row[18] || "").trim(),
+    pollUrl: String(row[19] || "").trim(),
+    pollEndsAt: row[20] || "",
+    pollMessageId: String(row[21] || "").replace(/^'/, "").trim(),
+    pollChannelId: String(row[22] || "").replace(/^'/, "").trim(),
+    processResult: String(row[23] || "").trim(),
+    passAnnouncementMessageId: String(row[24] || "").replace(/^'/, "").trim(),
+    updatedAt: row[25] || "",
+  };
+}
+
+async function readInterviewRecords() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${interviewManagementSheetName}'!A11:Z1000`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  return (response.data.values || [])
+    .map((row, index) => interviewRecordFromRow(row, index + 11))
+    .filter((record) => record.id);
+}
+
+async function readStep1Applications() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${applicationSheetName}'!A11:AA1000`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  return (response.data.values || [])
+    .map((row, index) => applicationFromSheetRow(row, index + 11))
+    .filter((application) => application.id);
+}
+
+async function eligibleInterviewApplications(setting, search = "") {
+  const [applications, records] = await Promise.all([readStep1Applications(), readInterviewRecords()]);
+  const reserved = new Set(records
+    .filter((record) => record.interviewStatus !== "CANCELLED")
+    .map((record) => record.applicationId));
+  const needle = String(search || "").trim().toLowerCase();
+  return applications.filter((application) => (
+    application.pollStatus === "FINAL"
+    && application.verdict === "合格"
+    && application.passAnnouncementMessageId
+    && (!setting.roundName || application.roundName === setting.roundName)
+    && !reserved.has(application.id)
+    && (!needle || [application.id, application.name, application.discordId]
+      .some((value) => String(value || "").toLowerCase().includes(needle)))
+  ));
+}
+
+function interviewQuestionsText(questions) {
+  return questions.map((question, index) => {
+    const required = question.required ? "【必須】" : "【任意】";
+    const note = question.note ? `\n   補足: ${question.note}` : "";
+    return `${index + 1}. ${required} ${question.text}${note}`;
+  }).join("\n");
+}
+
+function nextInterviewId(applicationId, records) {
+  const count = records.filter((record) => record.applicationId === applicationId).length + 1;
+  return `INT-${applicationId}-${String(count).padStart(2, "0")}`;
+}
+
+async function reserveInterview(setting, application, interviewer, questions) {
+  const records = await readInterviewRecords();
+  if (records.some((record) => record.applicationId === application.id && record.interviewStatus !== "CANCELLED")) {
+    throw new Error("この応募者はすでに別の面接官が選択しています。");
+  }
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${interviewManagementSheetName}'!A11:A1000`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const ids = response.data.values || [];
+  const emptyIndex = Array.from({ length: 990 }, (_, index) => index)
+    .find((index) => !String(ids[index]?.[0] || "").trim());
+  if (emptyIndex === undefined) throw new Error("面接管理シートの保存行が不足しています。");
+  const rowNumber = emptyIndex + 11;
+  const id = nextInterviewId(application.id, records);
+  const applicantDiscordId = await resolveApplicantDiscordUserId(application.discordId);
+  const snapshot = interviewQuestionsText(questions);
+  const now = sheetDateTime(new Date());
+  const values = [
+    id,
+    application.id,
+    application.roundName,
+    application.name,
+    application.discordId,
+    discordIdCell(applicantDiscordId),
+    discordIdCell(interviewer.id),
+    interviewer.displayName || interviewer.user?.username || interviewer.id,
+    now,
+    "",
+    setting.questionSet,
+    snapshot,
+    "",
+    "IN_PROGRESS",
+    "",
+    0,
+    0,
+    0,
+    "",
+    "",
+    "",
+    "",
+    "",
+    "質問回答待ち",
+    "",
+    now,
+  ];
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${interviewManagementSheetName}'!A${rowNumber}:Z${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [values] },
+  });
+  return interviewRecordFromRow(values, rowNumber);
+}
+
+function canInterview(interaction, setting) {
+  if (interaction.guildId !== guildId || interaction.channelId !== setting.commandChannelId) return false;
+  if (setting.interviewerRoleId) return Boolean(interaction.member?.roles?.cache?.has(setting.interviewerRoleId));
+  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
+}
+
+function interviewSessionComponents(record, ready = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`iv:notes:${record.id}`)
+      .setLabel(ready ? "回答メモを修正" : "回答メモを入力")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`iv:vote:${record.id}`)
+      .setLabel("面接を完了して投票開始")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!ready),
+    new ButtonBuilder()
+      .setCustomId(`iv:cancel:${record.id}`)
+      .setLabel("面接をキャンセル")
+      .setStyle(ButtonStyle.Danger),
+  )];
+}
+
+function interviewSessionEmbed(record) {
+  return new EmbedBuilder()
+    .setColor(record.answerMemo ? 0x16a34a : 0x2563eb)
+    .setTitle(`STEP2 面接進行｜${record.applicantName || record.applicationId}`)
+    .setDescription(`応募ID: **${record.applicationId}**\n面接ID: **${record.id}**`)
+    .addFields(
+      { name: "質問リスト", value: truncateDiscord(record.questionSnapshot, 1024) },
+      { name: "回答メモ", value: record.answerMemo ? truncateDiscord(record.answerMemo, 1024) : "未入力" },
+    )
+    .setFooter({ text: "この画面と回答メモは実行した面接官だけに表示されます" });
+}
+
+async function interviewRecordById(id) {
+  return (await readInterviewRecords()).find((record) => record.id === id) || null;
+}
+
+async function updateInterviewRecord(record, valuesByColumn) {
+  const data = Object.entries(valuesByColumn).map(([column, value]) => ({
+    range: `'${interviewManagementSheetName}'!${column}${record.rowNumber}`,
+    values: [[value]],
+  }));
+  data.push({ range: `'${interviewManagementSheetName}'!Z${record.rowNumber}`, values: [[sheetDateTime(new Date())]] });
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: { valueInputOption: "USER_ENTERED", data },
+  });
+}
+
+async function settingForInteraction(interaction) {
+  const settings = await readInterviewSettings();
+  return settings.find((setting) => setting.commandChannelId === interaction.channelId) || null;
+}
+
+async function handleInterviewCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const setting = await settingForInteraction(interaction);
+  if (!setting) {
+    await interaction.editReply("このチャンネルは「面接設定」で有効化されていません。");
+    return;
+  }
+  if (!canInterview(interaction, setting)) {
+    await interaction.editReply("このコマンドを実行できる面接官ロールがありません。");
+    return;
+  }
+  const search = interaction.options.getString("search") || "";
+  const candidates = await eligibleInterviewApplications(setting, search);
+  if (!candidates.length) {
+    await interaction.editReply(search
+      ? `「${search}」に一致する面接待ちの書類合格者はいません。`
+      : "現在、面接待ちの書類合格者はいません。");
+    return;
+  }
+  const shown = candidates.slice(0, 25);
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`iv:select:${setting.rowNumber}`)
+    .setPlaceholder("面接する応募者を選択")
+    .addOptions(shown.map((application) => new StringSelectMenuOptionBuilder()
+      .setLabel(truncateDiscord(`${application.name || application.discordId} — ${application.id}`, 100))
+      .setDescription(truncateDiscord(`${application.discordId} / ${application.roundName}`, 100))
+      .setValue(application.id)));
+  const description = candidates.length > 25
+    ? `候補者${candidates.length}人のうち先頭25人を表示しています。/mensetu の search で名前・応募IDを絞り込めます。`
+    : `書類合格通知済みの候補者${candidates.length}人から選択してください。`;
+  await interaction.editReply({
+    embeds: [new EmbedBuilder().setColor(0x2563eb).setTitle("STEP2 面接対象者を選択").setDescription(description)],
+    components: [new ActionRowBuilder().addComponents(select)],
+  });
+}
+
+async function handleInterviewSelect(interaction) {
+  const setting = await settingForInteraction(interaction);
+  if (!setting || !canInterview(interaction, setting)) throw new Error("面接設定または実行権限を確認できません。");
+  const applicationId = interaction.values[0];
+  const candidates = await eligibleInterviewApplications(setting, applicationId);
+  const application = candidates.find((candidate) => candidate.id === applicationId);
+  if (!application) throw new Error("この応募者は現在面接対象ではありません。再度 /mensetu を実行してください。");
+  const questions = await readInterviewQuestions(setting.questionSet);
+  if (!questions.length) throw new Error(`質問セット「${setting.questionSet}」に有効な質問がありません。`);
+  const record = await reserveInterview(setting, application, interaction.member, questions);
+  await interaction.editReply({
+    embeds: [interviewSessionEmbed(record)],
+    components: interviewSessionComponents(record, false),
+  });
+}
+
+async function handleInterviewNotesButton(interaction, interviewId) {
+  const record = await interviewRecordById(interviewId);
+  if (!record || record.interviewerId !== interaction.user.id) {
+    await interaction.reply({ content: "この面接を操作できる面接官ではありません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!["IN_PROGRESS", "READY"].includes(record.interviewStatus)) {
+    await interaction.reply({ content: "この面接はすでに投票段階へ進んでいます。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const input = new TextInputBuilder()
+    .setCustomId("memo")
+    .setLabel("質問番号ごとに回答・評価メモを記入")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000)
+    .setPlaceholder("1. 回答…\n2. 回答…\n総合所見…");
+  if (record.answerMemo) input.setValue(record.answerMemo.slice(0, 4000));
+  await interaction.showModal(new ModalBuilder()
+    .setCustomId(`iv:modal:${record.id}`)
+    .setTitle("STEP2 面接回答メモ")
+    .addComponents(new ActionRowBuilder().addComponents(input)));
+}
+
+async function handleInterviewNotesModal(interaction, interviewId) {
+  const record = await interviewRecordById(interviewId);
+  if (!record || record.interviewerId !== interaction.user.id) throw new Error("この面接を操作できません。");
+  if (!["IN_PROGRESS", "READY"].includes(record.interviewStatus)) throw new Error("この面接は回答を変更できません。");
+  const memo = interaction.fields.getTextInputValue("memo").trim();
+  await updateInterviewRecord(record, { M: memo, N: "READY", X: "回答メモ保存済み" });
+  Object.assign(record, { answerMemo: memo, interviewStatus: "READY", processResult: "回答メモ保存済み" });
+  await interaction.editReply({ embeds: [interviewSessionEmbed(record)], components: interviewSessionComponents(record, true) });
+}
+
+function interviewPollEmbed(record) {
+  return new EmbedBuilder()
+    .setColor(0x7c3aed)
+    .setTitle(`STEP2 面接審査｜${record.applicantName || record.applicationId}`)
+    .setDescription(`応募ID: **${record.applicationId}**\n面接官: **${record.interviewerName}**`)
+    .addFields(
+      { name: "質問リスト", value: truncateDiscord(record.questionSnapshot, 1024) },
+      { name: "面接回答・評価メモ", value: truncateDiscord(record.answerMemo, 1024) },
+    )
+    .setTimestamp();
+}
+
+async function createInterviewPoll(setting, record) {
+  const channel = await textChannel(setting.pollChannelId, "面接投票");
+  const message = await channel.send({
+    content: setting.pollMessage,
+    embeds: [interviewPollEmbed(record)],
+    poll: {
+      question: { text: `${truncateDiscord(record.applicantName || record.applicationId, 220)} を面接合格としますか？` },
+      answers: [
+        { text: "合格", emoji: "✅" },
+        { text: "不合格", emoji: "❌" },
+      ],
+      allowMultiselect: false,
+      duration: setting.pollDurationHours,
+    },
+    allowedMentions: { parse: [] },
+  });
+  return message;
+}
+
+async function handleInterviewVoteButton(interaction, interviewId) {
+  const record = await interviewRecordById(interviewId);
+  if (!record || record.interviewerId !== interaction.user.id) throw new Error("この面接を操作できません。");
+  if (record.interviewStatus !== "READY" || !record.answerMemo) throw new Error("先に回答メモを保存してください。");
+  const settings = await readInterviewSettings();
+  const setting = settings.find((item) => !item.roundName || item.roundName === record.roundName);
+  if (!setting?.pollChannelId) throw new Error("面接設定の投票チャンネルIDが未設定です。");
+  const message = await createInterviewPoll(setting, record);
+  const pollEndsAt = message.poll?.expiresTimestamp ? sheetDateTime(new Date(message.poll.expiresTimestamp)) : "";
+  await updateInterviewRecord(record, {
+    J: sheetDateTime(new Date()),
+    N: "PREVIEW",
+    O: "PREVIEW",
+    P: 0,
+    Q: 0,
+    R: 0,
+    S: "投票待ち",
+    T: message.url,
+    U: pollEndsAt,
+    V: discordIdCell(message.id),
+    W: discordIdCell(message.channelId),
+    X: "面接投票を開始",
+  });
+  await interaction.editReply({
+    content: `面接メモを保存し、面接投票を開始しました。\n${message.url}`,
+    embeds: [],
+    components: [],
+  });
+}
+
+async function handleInterviewCancelButton(interaction, interviewId) {
+  const record = await interviewRecordById(interviewId);
+  if (!record || record.interviewerId !== interaction.user.id) throw new Error("この面接を操作できません。");
+  if (!["IN_PROGRESS", "READY"].includes(record.interviewStatus)) throw new Error("投票開始後の面接はキャンセルできません。");
+  await updateInterviewRecord(record, { N: "CANCELLED", X: "面接官がキャンセル" });
+  await interaction.editReply({ content: "面接をキャンセルしました。応募者は再び候補一覧へ戻ります。", embeds: [], components: [] });
+}
+
+async function sendInterviewPass(setting, record) {
+  if (!setting.passChannelId) throw new Error("面接合格発表チャンネルIDが未設定です");
+  const channel = await textChannel(setting.passChannelId, "面接合格発表");
+  const userId = record.applicantDiscordId || await resolveApplicantDiscordUserId(record.applicantDiscordName);
+  const content = [setting.passMessage, userId ? `<@${userId}>` : ""].filter(Boolean).join("\n");
+  const message = await channel.send({
+    content,
+    allowedMentions: { users: userId ? [userId] : [] },
+    nonce: `interview-pass-${record.id}`,
+    enforceNonce: true,
+  });
+  return { messageId: message.id, applicantMatched: Boolean(userId) };
+}
+
+async function processInterviewPolls() {
+  const now = Date.now();
+  if (now - lastInterviewPollAt < interviewPollIntervalMs) return;
+  lastInterviewPollAt = now;
+  let settings;
+  try {
+    settings = await readInterviewSettings();
+  } catch (error) {
+    if (error.code === 400 || /Unable to parse range|not found/i.test(error.message || "")) return;
+    throw error;
+  }
+  if (!settings.length) return;
+  const records = await readInterviewRecords();
+  for (const setting of settings) {
+    const targetRecords = records.filter((record) => !setting.roundName || record.roundName === setting.roundName);
+    let updatedCount = 0;
+    let announcedCount = 0;
+    for (const record of targetRecords) {
+      if (record.pollMessageId && record.pollStatus !== "FINAL") {
+        try {
+          const channel = await textChannel(record.pollChannelId, "面接投票");
+          const message = await channel.messages.fetch({ message: record.pollMessageId, force: true });
+          const fetchedVotes = await fetchPollVoteCounts(message);
+          const totalVotes = fetchedVotes.passVotes + fetchedVotes.failVotes;
+          const expiresTimestamp = message.poll?.expiresTimestamp || 0;
+          const expired = expiresTimestamp > 0 && expiresTimestamp <= Date.now();
+          let finalized = Boolean(message.poll?.resultsFinalized) || expired;
+          let processResult = finalized ? "面接投票を確定" : "面接投票結果を自動読込中";
+          if (!finalized && totalVotes >= setting.pollVoteLimit) {
+            await message.poll.end();
+            finalized = true;
+            processResult = `締切投票数${setting.pollVoteLimit}票に到達して確定`;
+          }
+          const verdict = pollVerdict(fetchedVotes.passVotes, totalVotes);
+          const pollStatus = finalized ? "FINAL" : "PREVIEW";
+          if (record.passVotes !== fetchedVotes.passVotes
+            || record.failVotes !== fetchedVotes.failVotes
+            || record.totalVotes !== totalVotes
+            || record.pollStatus !== pollStatus) {
+            await updateInterviewRecord(record, {
+              N: pollStatus,
+              O: pollStatus,
+              P: fetchedVotes.passVotes,
+              Q: fetchedVotes.failVotes,
+              R: totalVotes,
+              S: verdict,
+              X: processResult,
+            });
+            Object.assign(record, {
+              interviewStatus: pollStatus,
+              pollStatus,
+              passVotes: fetchedVotes.passVotes,
+              failVotes: fetchedVotes.failVotes,
+              totalVotes,
+              verdict,
+              processResult,
+            });
+            updatedCount += 1;
+          }
+        } catch (error) {
+          await updateInterviewRecord(record, { X: `面接投票読込エラー: ${error.message}` });
+        }
+      }
+      if (record.pollStatus === "FINAL" && record.verdict === "合格" && !record.passAnnouncementMessageId) {
+        if (!setting.passChannelId) {
+          await updateInterviewRecord(record, { X: `${record.processResult || "面接合格"} / 合格発表チャンネル待ち` });
+          continue;
+        }
+        try {
+          const announcement = await sendInterviewPass(setting, record);
+          const result = `${record.processResult || "面接結果を確定"} / 面接合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+          await updateInterviewRecord(record, { X: result, Y: discordIdCell(announcement.messageId) });
+          record.passAnnouncementMessageId = announcement.messageId;
+          announcedCount += 1;
+        } catch (error) {
+          await updateInterviewRecord(record, { X: `面接合格発表エラー: ${error.message}` });
+        }
+      }
+    }
+    const activeCount = targetRecords.filter((record) => ["IN_PROGRESS", "READY", "PREVIEW"].includes(record.interviewStatus)).length;
+    const finalCount = targetRecords.filter((record) => record.pollStatus === "FINAL").length;
+    await writeInterviewStatus(
+      setting,
+      `STEP2稼働中: 面接${targetRecords.length}件 / 進行中${activeCount}件 / FINAL${finalCount}件 / 更新${updatedCount}件 / 合格発表${announcedCount}件`,
+    );
+  }
+}
+
+async function registerInterviewCommand(guild) {
+  const commandData = new SlashCommandBuilder()
+    .setName("mensetu")
+    .setDescription("STEP1書類合格者から面接対象者を選択します")
+    .setDMPermission(false)
+    .addStringOption((option) => option
+      .setName("search")
+      .setDescription("応募ID・街での名前・Discordユーザー名で絞り込み")
+      .setRequired(false))
+    .toJSON();
+  const commands = await guild.commands.fetch();
+  const current = commands.find((command) => command.name === "mensetu");
+  if (current) await current.edit(commandData);
+  else await guild.commands.create(commandData);
+  console.log("面接コマンド登録完了: /mensetu");
+}
+
+async function enqueueInterviewInteraction(label, interaction, work) {
+  await enqueue(label, async () => {
+    try {
+      await work();
+    } catch (error) {
+      const message = `面接処理エラー: ${error.message || error}`;
+      console.error(message);
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
+      } else {
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+  });
+}
+
+client.on("interactionCreate", async (interaction) => {
+  if (interaction.guildId !== guildId) return;
+  try {
+    if (interaction.isChatInputCommand() && interaction.commandName === "mensetu") {
+      await handleInterviewCommand(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("iv:select:")) {
+      await interaction.deferUpdate();
+      await enqueueInterviewInteraction("面接対象者選択", interaction, () => handleInterviewSelect(interaction));
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("iv:notes:")) {
+      await handleInterviewNotesButton(interaction, interaction.customId.slice("iv:notes:".length));
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("iv:modal:")) {
+      await interaction.deferUpdate();
+      await enqueueInterviewInteraction("面接メモ保存", interaction, () => handleInterviewNotesModal(interaction, interaction.customId.slice("iv:modal:".length)));
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("iv:vote:")) {
+      await interaction.deferUpdate();
+      await enqueueInterviewInteraction("面接投票開始", interaction, () => handleInterviewVoteButton(interaction, interaction.customId.slice("iv:vote:".length)));
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("iv:cancel:")) {
+      await interaction.deferUpdate();
+      await enqueueInterviewInteraction("面接キャンセル", interaction, () => handleInterviewCancelButton(interaction, interaction.customId.slice("iv:cancel:".length)));
+    }
+  } catch (error) {
+    const message = `面接処理エラー: ${error.message || error}`;
+    console.error(message);
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
+    else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+});
+
 async function processTerminations() {
   const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
   const completeColumn = terminationSheet.headerMap.get("手続き完了");
@@ -1747,8 +2355,14 @@ async function markRemoved(member) {
   console.log(`Discordサーバー脱退のため名簿削除: ${member.displayName || member.user.username}`);
 }
 
-client.once("clientReady", () => {
+client.once("clientReady", async () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
+  try {
+    const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+    await registerInterviewCommand(guild);
+  } catch (error) {
+    console.error("面接コマンド登録失敗:", error.message);
+  }
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 10000), 5000);
   const initialPollDelay = Math.max(actionPollInterval, 60000);
   const pollSheetActions = async () => {
@@ -1756,6 +2370,7 @@ client.once("clientReady", () => {
       await processSheetActions();
       await processBonusDistribution();
       await processRecruitmentApplications();
+      await processInterviewPolls();
       await processTerminations();
     });
     setTimeout(pollSheetActions, actionPollInterval);
@@ -1765,6 +2380,7 @@ client.once("clientReady", () => {
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
   console.log(`起動後の初回シート確認: ${initialPollDelay}ms後`);
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
+  console.log(`面接投票確認: ${interviewPollIntervalMs}ms間隔`);
 });
 client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
   await syncMember(member);
