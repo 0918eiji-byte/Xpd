@@ -1504,6 +1504,53 @@ function applicationLink(rowNumber) {
   return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${applicationSheetId}&range=A${rowNumber}:AD${rowNumber}`;
 }
 
+function staffProfileLink() {
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=2090134610&range=B4`;
+}
+
+async function staffProfile(discordId) {
+  const employeeSheet = await readEmployees();
+  const idColumn = employeeSheet.headerMap.get("社員ID");
+  const matchingRows = employeeSheet.rows.filter((item) => String(item[idColumn] || "").trim() === employeeId(discordId));
+  if (!matchingRows.length) return null;
+  if (matchingRows.length > 1) throw new Error(`社員ID ${employeeId(discordId)} が従業員名簿で重複しています。管理者が名簿を確認してください。`);
+  const [row] = matchingRows;
+  const value = (header) => {
+    const column = employeeSheet.headerMap.get(header);
+    return column === undefined ? "" : row[column];
+  };
+  return {
+    employeeId: String(value("社員ID") || ""),
+    discordId,
+    name: String(value("表示名") || ""),
+    roles: String(value("Discordロール") || ""),
+    rank: String(value("適用ランク") || "？？？？"),
+    factor: value(bonusFactorHeader),
+    operationResult: String(value("操作結果") || ""),
+    operationAt: value("操作日時"),
+  };
+}
+
+function staffProfileEmbed(profile, member) {
+  return new EmbedBuilder()
+    .setColor(0x2563eb)
+    .setTitle(`署員個票｜${truncateDiscord(profile.name || member.displayName, 220)}`)
+    .setURL(staffProfileLink())
+    .setThumbnail(member.displayAvatarURL({ size: 256 }))
+    .addFields(
+      { name: "社員ID", value: profile.employeeId, inline: true },
+      { name: "DiscordユーザーID", value: profile.discordId, inline: true },
+      { name: "現在の階級", value: profile.rank || "？？？？", inline: true },
+      { name: "Discord表示名", value: member.displayName, inline: true },
+      { name: "ユーザー名", value: member.user.username, inline: true },
+      { name: "ランク係数", value: String(profile.factor ?? 0), inline: true },
+      { name: "階級ロール", value: truncateDiscord(profile.roles || "設定なし", 1024) },
+      { name: "最終操作", value: truncateDiscord([profile.operationResult, profile.operationAt].filter(Boolean).join("｜") || "履歴なし", 1024) },
+    )
+    .setFooter({ text: "従業員名簿の現在値を表示しています" })
+    .setTimestamp();
+}
+
 function applicationEmbed(application, title, color) {
   return new EmbedBuilder()
     .setColor(color)
@@ -2958,6 +3005,69 @@ async function registerInterviewCommand(guild) {
   console.log("面接コマンド登録完了: /mensetu");
 }
 
+async function registerStaffProfileCommand(guild) {
+  const commandData = new SlashCommandBuilder()
+    .setName("syoin")
+    .setDescription("DiscordユーザーIDから署員個票を表示します")
+    .setDMPermission(false)
+    .addUserOption((option) => option
+      .setName("user")
+      .setDescription("検索するDiscordユーザー")
+      .setRequired(false))
+    .addStringOption((option) => option
+      .setName("id")
+      .setDescription("17〜20桁のDiscordユーザーID（DC-付きでも可）")
+      .setRequired(false))
+    .toJSON();
+  const commands = await guild.commands.fetch();
+  const current = commands.find((command) => command.name === "syoin");
+  if (current) await current.edit(commandData);
+  else await guild.commands.create(commandData);
+  console.log("署員個票コマンド登録完了: /syoin");
+}
+
+function canViewStaffProfile(interaction) {
+  return Boolean(
+    interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)
+    || [...rosterRoleIds].some((id) => interaction.member?.roles?.cache?.has(id)),
+  );
+}
+
+async function handleStaffProfileCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!canViewStaffProfile(interaction)) {
+    await interaction.editReply("署員個票はPolice Officerロールを持つ署員または管理者のみ検索できます。");
+    return;
+  }
+  const selectedUser = interaction.options.getUser("user");
+  const rawId = String(interaction.options.getString("id") || "").trim();
+  if (selectedUser && rawId) {
+    await interaction.editReply("user または id のどちらか一方だけを指定してください。");
+    return;
+  }
+  const discordId = selectedUser?.id
+    || rawId.replace(/^DC-/i, "").replace(/[<@!>]/g, "")
+    || interaction.user.id;
+  if (!/^\d{17,20}$/.test(discordId)) {
+    await interaction.editReply("DiscordユーザーIDは17〜20桁の数字で入力してください。");
+    return;
+  }
+  const [profile, guild] = await Promise.all([
+    staffProfile(discordId),
+    client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
+  ]);
+  if (!profile) {
+    await interaction.editReply(`ID \`${discordId}\` は現在の従業員名簿に見つかりません。`);
+    return;
+  }
+  const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
+  if (!member) {
+    await interaction.editReply(`名簿には登録されていますが、Discordサーバー上で ID \`${discordId}\` を確認できません。`);
+    return;
+  }
+  await interaction.editReply({ embeds: [staffProfileEmbed(profile, member)] });
+}
+
 async function enqueueInterviewInteraction(label, interaction, work) {
   await enqueueInterview(label, async () => {
     try {
@@ -2984,6 +3094,10 @@ async function enqueueInterviewInteraction(label, interaction, work) {
 client.on("interactionCreate", async (interaction) => {
   if (interaction.guildId !== guildId) return;
   try {
+    if (interaction.isChatInputCommand() && interaction.commandName === "syoin") {
+      await handleStaffProfileCommand(interaction);
+      return;
+    }
     if (interaction.isChatInputCommand() && interaction.commandName === "mensetu") {
       await handleInterviewCommand(interaction);
       return;
@@ -3027,9 +3141,10 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (error) {
     const quotaLimited = registerSheetsQuotaError(error);
+    const isStaffProfileCommand = interaction.isChatInputCommand?.() && interaction.commandName === "syoin";
     const message = quotaLimited
-      ? `面接処理を一時待機しています。Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
-      : `面接処理エラー: ${error.message || error}`;
+      ? `Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
+      : `${isStaffProfileCommand ? "署員個票" : "面接"}処理エラー: ${error.message || error}`;
     console.error(message);
     if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -3206,8 +3321,9 @@ client.once("clientReady", async () => {
   try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
     await registerInterviewCommand(guild);
+    await registerStaffProfileCommand(guild);
   } catch (error) {
-    console.error("面接コマンド登録失敗:", error.message);
+    console.error("Discordコマンド登録失敗:", error.message);
   }
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 30000), 30000);
   const initialPollDelay = Math.max(actionPollInterval, 60000);
