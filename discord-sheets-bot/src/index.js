@@ -83,7 +83,7 @@ async function unifiedSettingsReady(force = false) {
 }
 
 function normalizedId(value) {
-  return String(value || "").replace(/^'/, "").trim();
+  return String(value ?? "").replace(/^'+/, "").replace(/[\s`]/g, "").trim();
 }
 
 function duplicateValues(values) {
@@ -2095,6 +2095,22 @@ async function readInterviewSettings() {
     .filter((setting) => setting.enabled);
 }
 
+function usableInterviewPollSetting(setting) {
+  const pollChannelId = normalizedId(setting?.pollChannelId);
+  return Boolean(setting?.enabled && /^\d{17,20}$/.test(pollChannelId));
+}
+
+function selectInterviewPollSetting(settings, record, interaction = null) {
+  const candidates = (settings || []).filter(usableInterviewPollSetting);
+  if (!candidates.length) return null;
+  // Prefer the round captured on the interview record.  If an older record has
+  // no matching round, fall back to the command-channel setting and finally to
+  // the first valid setting so a duplicate/blank row cannot mask a real one.
+  return candidates.find((setting) => setting.roundName && setting.roundName === record?.roundName)
+    || candidates.find((setting) => interaction && setting.commandChannelId === interaction.channelId)
+    || candidates[0];
+}
+
 async function writeInterviewStatus(setting, status) {
   const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : interviewSettingsSheetName;
   await sheets.spreadsheets.values.update({
@@ -2654,7 +2670,7 @@ async function handleInterviewVoteButton(interaction, interviewId) {
   if (!record || record.interviewerId !== interaction.user.id) throw new Error("この面接を操作できません。");
   if (record.interviewStatus !== "READY" || !interviewReady(record)) throw new Error("必須質問へすべて回答してください。");
   const settings = await readInterviewSettings();
-  const setting = settings.find((item) => !item.roundName || item.roundName === record.roundName);
+  const setting = selectInterviewPollSetting(settings, record, interaction);
   if (!setting?.pollChannelId) throw new Error("面接設定の投票チャンネルIDが未設定です。");
   const message = await createInterviewPoll(setting, record);
   const pollEndsAt = message.poll?.expiresTimestamp ? sheetDateTime(new Date(message.poll.expiresTimestamp)) : "";
