@@ -2264,7 +2264,6 @@ async function eligibleInterviewApplications(setting, search = "") {
     && application.verdict === "合格"
     && application.passAnnouncementMessageId
     && application.documentRoleStatus.startsWith("書類合格ロール付与済")
-    && (!setting.roundName || application.roundName === setting.roundName)
     && (!needle || [application.id, application.name, application.discordId]
       .some((value) => String(value || "").toLowerCase().includes(needle)))
   ));
@@ -2342,7 +2341,7 @@ async function reserveInterview(setting, application, interviewer, questions) {
   if (emptyIndex === undefined) throw new Error("面接管理シートの保存行が不足しています。");
   const rowNumber = emptyIndex + 11;
   const id = nextInterviewId(application.id, records);
-  const applicantDiscordId = await resolveApplicantDiscordUserId(application.discordId);
+  const applicantDiscordId = application.resolvedDiscordId || await resolveApplicantDiscordUserId(application.discordId);
   const snapshot = interviewQuestionSnapshot(questions);
   const now = sheetDateTime(new Date());
   const values = [
@@ -2504,7 +2503,6 @@ async function handleInterviewCommand(interaction) {
   }
   const activeRecord = (await readInterviewRecords())
     .filter((record) => record.interviewerId === interaction.user.id
-      && (!setting.roundName || record.roundName === setting.roundName)
       && ["IN_PROGRESS", "READY"].includes(record.interviewStatus))
     .sort((left, right) => right.rowNumber - left.rowNumber)[0];
   if (activeRecord) {
@@ -2909,9 +2907,14 @@ async function processInterviewPolls() {
     readRecruitmentSettings(),
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
   ]);
-  for (const setting of settings) {
-    const recruitmentSetting = recruitmentSettings.find((item) => item.roundName === setting.roundName);
-    const targetRecords = records.filter((record) => !setting.roundName || record.roundName === setting.roundName);
+  const configuredRounds = new Set(settings.map((setting) => setting.roundName).filter(Boolean));
+  for (const [settingIndex, setting] of settings.entries()) {
+    // 未設定の募集回は、最初の有効な面接設定を共通設定として使用する。
+    // 募集回を増やすたびに面接設定を複製しなくても、既存の面接待ちを処理できる。
+    const targetRecords = records.filter((record) => (
+      record.roundName === setting.roundName
+      || (settingIndex === 0 && !configuredRounds.has(record.roundName))
+    ));
     let updatedCount = 0;
     let announcedCount = 0;
     for (const record of targetRecords) {
@@ -2963,6 +2966,7 @@ async function processInterviewPolls() {
         }
       }
       if (record.pollStatus === "FINAL" && ["合格", "不合格"].includes(record.verdict)) {
+        const recruitmentSetting = recruitmentSettings.find((item) => item.roundName === record.roundName);
         await reconcileInterviewDecision(guild, setting, recruitmentSetting, record);
       }
       if (record.pollStatus === "FINAL" && record.verdict === "合格" && !record.passAnnouncementMessageId) {
