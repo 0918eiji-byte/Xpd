@@ -510,7 +510,7 @@ const interviewQuestionsSheetName = "面接質問設定";
 const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
 const staffReportSheetName = "署員報告";
-const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1441`;
+const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1443`;
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1561,7 +1561,9 @@ async function readRankOperationSettings() {
   const managementRoleId = map.get("ランク操作管理ロールID") || "";
   const promotionThreadId = map.get("昇格報告スレッドID") || "";
   const demotionThreadId = map.get("降格報告スレッドID") || "";
-  return { managementRoleId, promotionThreadId, demotionThreadId };
+  const warningThreadId = map.get("警告報告スレッドID") || "";
+  const reportThreadId = map.get("一般報告スレッドID") || "";
+  return { managementRoleId, promotionThreadId, demotionThreadId, warningThreadId, reportThreadId };
 }
 
 function rankOperationPermission(interaction, settings) {
@@ -3179,18 +3181,55 @@ async function handleRankCommand(interaction) {
 
 async function handleRankTargetSelect(interaction) {
   const discordId = interaction.values[0];
+  await interaction.update({
+    content: `対象Discord ID: **${discordId}**\n最初に操作項目を選択してください。`,
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`rank:action:${discordId}`)
+        .setPlaceholder("昇格・降格・警告・報告から選択")
+        .addOptions([
+          ["昇格", "ランクを上げる"],
+          ["降格", "ランクを下げる"],
+          ["警告", "ランク変更なしで警告を記録"],
+          ["報告", "ランク変更なしで報告を記録"],
+        ].map(([value, description]) => new StringSelectMenuOptionBuilder()
+          .setLabel(value)
+          .setDescription(description)
+          .setValue(value))),
+    )],
+  });
+}
+
+async function handleRankActionSelect(interaction, discordId) {
+  const action = interaction.values[0];
+  if (["警告", "報告"].includes(action)) {
+    await interaction.update({
+      content: `操作: **${action}**\nランクは変更しません。理由を入力してください。`,
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(action)}:none`)
+          .setLabel("理由を入力して実行")
+          .setStyle(ButtonStyle.Primary),
+      )],
+    });
+    return;
+  }
   const [guild, rankMap] = await Promise.all([
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
     readRankMap(),
   ]);
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
   const current = assessMember(member, rankMap).rankName || "？？？？";
-  const ranks = sortedRanks(rankMap).slice(0, 25);
+  const currentRank = rankByName(rankMap, current);
+  const ranks = sortedRanks(rankMap)
+    .filter((rank) => !currentRank || (action === "昇格" ? rank.priority < currentRank.priority : rank.priority > currentRank.priority))
+    .slice(0, 25);
+  if (!ranks.length) throw new Error(`${action}できる変更先ランクがありません。`);
   await interaction.update({
-    content: `対象: **${truncateDiscord(member.displayName, 100)}**\n現在のランク: **${current}**\n変更後ランクを選択してください。`,
+    content: `対象: **${truncateDiscord(member.displayName, 100)}**\n現在のランク: **${current}**\n操作: **${action}**\n変更後ランクを選択してください。`,
     components: [new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId(`rank:next:${discordId}`)
+        .setCustomId(`rank:next:${discordId}:${encodeURIComponent(action)}`)
         .setPlaceholder("変更後ランクを選択")
         .addOptions(ranks.map((rank) => new StringSelectMenuOptionBuilder()
           .setLabel(truncateDiscord(rank.rankName, 100))
@@ -3200,13 +3239,14 @@ async function handleRankTargetSelect(interaction) {
   });
 }
 
-async function handleRankNextSelect(interaction, discordId) {
+async function handleRankNextSelect(interaction, discordId, encodedAction) {
   const nextRank = interaction.values[0];
+  const action = decodeURIComponent(encodedAction);
   await interaction.update({
-    content: `変更後ランク: **${truncateDiscord(nextRank, 100)}**\n理由を入力して実行してください。理由は必須です。`,
+    content: `操作: **${action}**\n変更後ランク: **${truncateDiscord(nextRank, 100)}**\n理由を入力して実行してください。理由は必須です。`,
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(nextRank)}`)
+        .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(action)}:${encodeURIComponent(nextRank)}`)
         .setLabel("理由を入力して実行")
         .setStyle(ButtonStyle.Primary),
     )],
@@ -3214,17 +3254,17 @@ async function handleRankNextSelect(interaction, discordId) {
 }
 
 async function handleRankReasonButton(interaction) {
-  const [, , discordId, encodedRank] = interaction.customId.split(":");
+  const [, , discordId, encodedAction, encodedRank] = interaction.customId.split(":");
   const modal = new ModalBuilder()
-    .setCustomId(`rank:submit:${discordId}:${encodedRank}`)
-    .setTitle("ランク変更理由");
+    .setCustomId(`rank:submit:${discordId}:${encodedAction}:${encodedRank}`)
+    .setTitle("操作理由");
   const reason = new TextInputBuilder()
     .setCustomId("reason")
-    .setLabel("変更理由（必須）")
+    .setLabel("理由（必須）")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(500)
-    .setPlaceholder("昇格・降格の理由を入力してください");
+    .setPlaceholder("昇格・降格・警告・報告の理由を入力してください");
   modal.addComponents(new ActionRowBuilder().addComponents(reason));
   await interaction.showModal(modal);
 }
@@ -3233,7 +3273,8 @@ async function handleRankSubmit(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const settings = await readRankOperationSettings();
   if (!rankOperationPermission(interaction, settings)) throw new Error("ランク操作の管理ロールが設定されていないか、実行権限がありません。");
-  const [, , discordId, encodedRank] = interaction.customId.split(":");
+  const [, , discordId, encodedAction, encodedRank] = interaction.customId.split(":");
+  const action = decodeURIComponent(encodedAction);
   const nextRank = decodeURIComponent(encodedRank);
   const reason = String(interaction.fields.getTextInputValue("reason") || "").trim();
   if (!reason) throw new Error("変更理由は必須です。");
@@ -3244,29 +3285,41 @@ async function handleRankSubmit(interaction) {
   const rowIndex = employeeSheet.rows.findIndex((row) => String(row[idColumn] || "").trim() === employeeId(discordId));
   if (rowIndex < 0) throw new Error("対象者が署員一覧に存在しません。最新の一覧を開き直してください。");
   const currentRank = assessMember(member, rankMap).rankName || "？？？？";
-  const type = rankOperationType(rankMap, currentRank, nextRank);
-  const threadId = type === "昇格" ? settings.promotionThreadId : settings.demotionThreadId;
+  const isRankMovement = ["昇格", "降格"].includes(action);
+  if (isRankMovement && !nextRank) throw new Error("変更後ランクを選択してください。");
+  const type = isRankMovement ? action : action;
+  const threadId = action === "昇格"
+    ? settings.promotionThreadId
+    : action === "降格"
+      ? settings.demotionThreadId
+      : action === "警告"
+        ? settings.warningThreadId
+        : settings.reportThreadId;
   if (!/^\d{17,20}$/.test(threadId)) throw new Error(`${type}報告スレッドIDが未設定です。設定シートを確認してください。`);
   const thread = await client.channels.fetch(threadId);
   if (!thread?.isThread?.()) throw new Error(`${type}報告先がDiscordスレッドではありません。`);
-  const result = await applySelectedRank(guild, member, rankMap, nextRank, `Discord /rank: ${reason}`);
+  const result = isRankMovement
+    ? await applySelectedRank(guild, member, rankMap, nextRank, `Discord /rank: ${reason}`)
+    : { transition: `${currentRank}（変更なし）` };
   const rowNumber = rowIndex + 3;
   await writeActionResult(employeeSheet, rowNumber, {
-    "適用ランク": nextRank,
-    "Discordロール": rankByName(rankMap, nextRank)?.roleName || nextRank,
-    "操作結果": `完了: ${result.transition} / ${reason}`,
+    ...(isRankMovement ? {
+      "適用ランク": nextRank,
+      "Discordロール": rankByName(rankMap, nextRank)?.roleName || nextRank,
+    } : {}),
+    "操作結果": `完了: ${type}${isRankMovement ? ` ${result.transition}` : "（ランク変更なし）"} / ${reason}`,
     "操作日時": new Date().toISOString(),
   });
   const report = await thread.send({
-    content: `【${type}報告】\n対象: <@${discordId}>\n変更: ${currentRank} → ${nextRank}\n理由: ${reason}\n実行者: <@${interaction.user.id}>`,
+    content: `【${type}報告】\n対象: <@${discordId}>\n変更: ${isRankMovement ? `${currentRank} → ${nextRank}` : "なし"}\n理由: ${reason}\n実行者: <@${interaction.user.id}>`,
     allowedMentions: { users: [discordId, interaction.user.id] },
   });
   const threadUrl = `https://discord.com/channels/${guildId}/${thread.id}/${report.id}`;
   await appendStaffReport({
     at: sheetDateTime(new Date()), discordId, name: member.displayName,
     actorId: interaction.user.id, actorName: interaction.user.username,
-    previousRank: currentRank, nextRank, reason, type, threadUrl,
-    result: `完了: ${result.transition}`,
+    previousRank: currentRank, nextRank: isRankMovement ? nextRank : "変更なし", reason, type, threadUrl,
+    result: `完了: ${type}${isRankMovement ? ` ${result.transition}` : "（ランク変更なし）"}`,
   });
   await interaction.editReply({ content: `${type}を実行しました。\n${threadUrl}` });
 }
@@ -3355,8 +3408,13 @@ client.on("interactionCreate", async (interaction) => {
       await handleRankTargetSelect(interaction);
       return;
     }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:action:")) {
+      await handleRankActionSelect(interaction, interaction.customId.slice("rank:action:".length));
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:next:")) {
-      await handleRankNextSelect(interaction, interaction.customId.slice("rank:next:".length));
+      const [, , discordId, encodedAction] = interaction.customId.split(":");
+      await handleRankNextSelect(interaction, discordId, encodedAction);
       return;
     }
     if (interaction.isButton() && interaction.customId.startsWith("rank:reason:")) {
