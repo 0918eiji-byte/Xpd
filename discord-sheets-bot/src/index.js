@@ -70,7 +70,7 @@ const unifiedSettingsBlocks = new Map([
   ["面接質問", [423, 1425]],
   ["連携", [1427, 1437]],
   ["ランク報告", [1437, 1446]],
-  ["操作ボード", [1447, 1452]],
+  ["操作ボード", [1447, 1455]],
 ]);
 let unifiedSettingsSheetId = null;
 let displayedSettingsCategory = "";
@@ -533,10 +533,11 @@ const onboardingSheetName = "採用手続き管理";
 const staffProfileSheetName = "署員個票";
 const staffProfileSheetId = 2090134610;
 const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1440:B1445`;
-const commandBoardConfigRange = `'${unifiedSettingsSheetName}'!A1448:B1452`;
+const commandBoardConfigRange = `'${unifiedSettingsSheetName}'!A1448:B1455`;
 const commandBoardCooldownMs = 5000;
 const commandBoardCooldowns = new Map();
 const commandBoardLocks = new Set();
+const commandBoardChannels = new Map();
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1687,64 +1688,73 @@ async function readCommandBoardSettings() {
   const values = response.data.values || [];
   const map = new Map(values.map((row) => [String(row[0] || "").trim(), row[1]]));
   return {
-    channelId: normalizedId(map.get("操作ボードチャンネルID")),
-    messageId: normalizedId(map.get("操作ボードメッセージID")),
-    enabled: isEnabledSetting(map.get("操作ボード有効")),
+    interviewChannelId: normalizedId(map.get("面接ボードチャンネルID")),
+    interviewMessageId: normalizedId(map.get("面接ボードメッセージID")),
+    interviewEnabled: isEnabledSetting(map.get("面接ボード有効")),
+    rankChannelId: normalizedId(map.get("ランク管理ボードチャンネルID")),
+    rankMessageId: normalizedId(map.get("ランク管理ボードメッセージID")),
+    rankEnabled: isEnabledSetting(map.get("ランク管理ボード有効")),
   };
 }
 
-function commandBoardEmbed() {
+function commandBoardEmbed(kind) {
+  const interview = kind === "interview";
   return new EmbedBuilder()
-    .setColor(0x1f4e79)
-    .setTitle("XPD管理 操作ボード")
-    .setDescription("各ボタンから機能を開始できます。権限のない機能は実行できません。\n連打防止のため、操作ボードのボタンは5秒に1回までです。")
-    .addFields(
-      { name: "面接（/mensetu）", value: "書類合格者を選択して面接を開始します。質問に回答後、投票へ進みます。", inline: false },
-      { name: "ランク操作（/rank）", value: "署員を選び、昇格・降格・警告・報告を実行します。備考は必須です。", inline: false },
-      { name: "署員個票（/syoin）", value: "自分の署員情報・ランク変更履歴・報告欄を表示します。", inline: false },
-    )
-    .setFooter({ text: "詳細検索が必要な場合は /mensetu・/rank・/syoin を使用してください" })
+    .setColor(interview ? 0x2563eb : 0x15803d)
+    .setTitle(interview ? "XPD管理｜面接ボード" : "XPD管理｜ランク管理ボード")
+    .setDescription(`このチャンネルは${interview ? "面接" : "ランク管理"}専用です。権限のない機能は実行できません。\n連打防止のため、ボタンは5秒に1回までです。`)
+    .addFields(...(interview
+      ? [{ name: "面接（/mensetu）", value: "書類合格者を選択して面接を開始します。質問に回答後、投票へ進みます。", inline: false }]
+      : [
+        { name: "ランク操作（/rank）", value: "署員を選び、昇格・降格・警告・報告を実行します。備考は必須です。", inline: false },
+        { name: "署員個票（/syoin）", value: "自分の署員情報・ランク変更履歴・報告欄を表示します。", inline: false },
+      ]))
+    .setFooter({ text: interview ? "詳細検索は /mensetu を使用してください" : "検索は /rank・/syoin を使用してください" })
     .setTimestamp();
 }
 
-function commandBoardComponents() {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("command:mensetu").setLabel("面接を開始").setStyle(ButtonStyle.Primary),
+function commandBoardComponents(kind) {
+  return [new ActionRowBuilder().addComponents(...(kind === "interview"
+    ? [new ButtonBuilder().setCustomId("command:mensetu").setLabel("面接を開始").setStyle(ButtonStyle.Primary)]
+    : [
       new ButtonBuilder().setCustomId("command:rank").setLabel("ランク操作").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId("command:syoin").setLabel("署員個票").setStyle(ButtonStyle.Secondary),
-    ),
-  ];
+    ]))];
 }
 
-async function ensureCommandBoard(guild) {
-  const settings = await readCommandBoardSettings();
-  if (!settings.enabled) {
-    console.log("操作ボード: 設定で無効です");
+async function ensureCommandBoard(guild, kind, channelId, messageId, enabled) {
+  const interview = kind === "interview";
+  if (!enabled) {
+    console.log(`${interview ? "面接" : "ランク管理"}ボード: 設定で無効です`);
     return;
   }
-  let channelId = settings.channelId;
   if (!/^\d{17,20}$/.test(channelId)) {
-    const interviewSettings = await readInterviewSettings();
-    channelId = interviewSettings.find((setting) => setting.enabled && /^\d{17,20}$/.test(setting.commandChannelId))?.commandChannelId || "";
+    if (interview) {
+      const interviewSettings = await readInterviewSettings();
+      channelId = interviewSettings.find((setting) => setting.enabled && /^\d{17,20}$/.test(setting.commandChannelId))?.commandChannelId || "";
+    } else {
+      channelId = (await readRankOperationSettings()).reportChannelId;
+    }
   }
-  if (!/^\d{17,20}$/.test(channelId)) throw new Error("操作ボードチャンネルIDが未設定です");
+  if (!/^\d{17,20}$/.test(channelId)) throw new Error(`${interview ? "面接" : "ランク管理"}ボードチャンネルIDが未設定です`);
   const channel = await guild.channels.fetch(channelId);
-  if (!channel?.isTextBased?.() || channel.isThread?.()) throw new Error("操作ボードチャンネルIDが無効です");
-  const payload = { embeds: [commandBoardEmbed()], components: commandBoardComponents() };
+  if (!channel?.isTextBased?.() || channel.isThread?.()) throw new Error(`${interview ? "面接" : "ランク管理"}ボードチャンネルIDが無効です`);
+  const payload = { embeds: [commandBoardEmbed(kind)], components: commandBoardComponents(kind) };
   let message = null;
-  if (/^\d{17,20}$/.test(settings.messageId)) message = await channel.messages.fetch(settings.messageId).catch(() => null);
+  if (/^\d{17,20}$/.test(messageId)) message = await channel.messages.fetch(messageId).catch(() => null);
   if (message) await message.edit(payload);
   else {
     message = await channel.send(payload);
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `'${unifiedSettingsSheetName}'!B1451`,
+      range: `'${unifiedSettingsSheetName}'!${interview ? "B1451" : "B1454"}`,
       valueInputOption: "RAW",
       requestBody: { values: [[message.id]] },
     });
   }
-  console.log(`操作ボードを設置/更新: #${channel.name} (${message.id})`);
+  commandBoardChannels.set(interview ? "mensetu" : "rank", channel.id);
+  if (!interview) commandBoardChannels.set("syoin", channel.id);
+  console.log(`${interview ? "面接" : "ランク管理"}ボードを設置/更新: #${channel.name} (${message.id})`);
 }
 
 function commandBoardCooldownKey(interaction) {
@@ -3610,6 +3620,12 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.guildId !== guildId) return;
   try {
     if (interaction.isButton() && interaction.customId.startsWith("command:")) {
+      const action = interaction.customId.slice("command:".length);
+      const expectedChannelId = commandBoardChannels.get(action === "mensetu" ? "mensetu" : "rank");
+      if (!expectedChannelId || interaction.channelId !== expectedChannelId) {
+        await interaction.reply({ content: "このボタンは別の専用チャンネルでのみ使用できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
       const remaining = consumeCommandBoardCooldown(interaction);
       if (remaining > 0) {
         await interaction.reply({ content: `連打防止中です。${remaining}秒後にもう一度押してください。`, flags: MessageFlags.Ephemeral });
@@ -3622,7 +3638,6 @@ client.on("interactionCreate", async (interaction) => {
       }
       commandBoardLocks.add(lockKey);
       try {
-        const action = interaction.customId.slice("command:".length);
         if (action === "mensetu") await handleInterviewCommand(interaction);
         else if (action === "rank") await handleRankCommand(interaction);
         else if (action === "syoin") await handleStaffProfileCommand(interaction);
@@ -3899,7 +3914,9 @@ client.once("clientReady", async () => {
     await registerInterviewCommand(guild);
     await registerStaffProfileCommand(guild);
     await registerRankCommand(guild);
-    await ensureCommandBoard(guild);
+    const boardSettings = await readCommandBoardSettings();
+    await ensureCommandBoard(guild, "interview", boardSettings.interviewChannelId, boardSettings.interviewMessageId, boardSettings.interviewEnabled);
+    await ensureCommandBoard(guild, "rank", boardSettings.rankChannelId, boardSettings.rankMessageId, boardSettings.rankEnabled);
   } catch (error) {
     console.error("Discordコマンド登録失敗:", error.message);
   }
