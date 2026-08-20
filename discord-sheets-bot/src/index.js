@@ -508,6 +508,8 @@ const interviewSettingsSheetName = "面接設定";
 const interviewQuestionsSheetName = "面接質問設定";
 const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
+const staffReportSheetName = "署員報告";
+const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1441`;
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1503,7 +1505,7 @@ function staffProfileLink() {
 }
 
 async function staffProfile(discordId) {
-  const employeeSheet = await readEmployees();
+  const [employeeSheet, reportSummary] = await Promise.all([readEmployees(), readStaffReportSummary(discordId)]);
   const idColumn = employeeSheet.headerMap.get("社員ID");
   const matchingRows = employeeSheet.rows.filter((item) => String(item[idColumn] || "").trim() === employeeId(discordId));
   if (!matchingRows.length) return null;
@@ -1520,7 +1522,7 @@ async function staffProfile(discordId) {
     roles: String(value("Discordロール") || ""),
     rank: String(value("適用ランク") || "？？？？"),
     factor: value(bonusFactorHeader),
-    report: String(value("報告欄") || ""),
+    report: reportSummary || String(value("報告欄") || ""),
     operationResult: String(value("操作結果") || ""),
     operationAt: value("操作日時"),
   };
@@ -1545,6 +1547,73 @@ function staffProfileEmbed(profile, member) {
     )
     .setFooter({ text: "従業員名簿の現在値を表示しています" })
     .setTimestamp();
+}
+
+async function readRankOperationSettings() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: rankOperationConfigRange,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const values = response.data.values || [];
+  const map = new Map(values.map((row) => [String(row[0] || "").trim(), normalizedId(row[1])]));
+  const managementRoleId = map.get("ランク操作管理ロールID") || "";
+  const promotionThreadId = map.get("昇格報告スレッドID") || "";
+  const demotionThreadId = map.get("降格報告スレッドID") || "";
+  return { managementRoleId, promotionThreadId, demotionThreadId };
+}
+
+function rankOperationPermission(interaction, settings) {
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+  return Boolean(settings.managementRoleId && interaction.member?.roles?.cache?.has(settings.managementRoleId));
+}
+
+function rankOperationType(rankMap, previousRank, nextRank) {
+  const before = rankByName(rankMap, previousRank);
+  const after = rankByName(rankMap, nextRank);
+  if (!before || !after || before.priority === after.priority) return "ランク変更";
+  return after.priority < before.priority ? "昇格" : "降格";
+}
+
+async function appendStaffReport(fields) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range: `'${staffReportSheetName}'!A:K`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [[
+      fields.at,
+      discordIdCell(fields.discordId),
+      fields.name,
+      fields.actorId,
+      fields.actorName,
+      fields.previousRank,
+      fields.nextRank,
+      fields.reason,
+      fields.type,
+      fields.threadUrl || "",
+      fields.result,
+    ]] },
+  });
+}
+
+async function readStaffReportSummary(discordId) {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${staffReportSheetName}'!A2:K500`,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    });
+    return (response.data.values || [])
+      .filter((row) => String(row[1] || "").replace(/^'/, "").trim() === discordId)
+      .slice(-5)
+      .reverse()
+      .map((row) => `[${row[0] || "日時不明"}] ${row[8] || "ランク変更"}: ${row[5] || "？？？？"} → ${row[6] || "？？？？"} / ${row[7] || "理由なし"}`)
+      .join("\n");
+  } catch (error) {
+    if (error.code === 400 || /Unable to parse range|not found/i.test(error.message || "")) return "";
+    throw error;
+  }
 }
 
 function applicationEmbed(application, title, color) {
@@ -3042,6 +3111,165 @@ async function registerStaffProfileCommand(guild) {
   console.log("署員個票コマンド登録完了: /syoin");
 }
 
+async function registerRankCommand(guild) {
+  const commandData = new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("署員のランク変更を申請・実行します")
+    .setDMPermission(false)
+    .addStringOption((option) => option
+      .setName("search")
+      .setDescription("署員名またはDiscord IDで検索（省略すると一覧）")
+      .setRequired(false))
+    .toJSON();
+  const commands = await guild.commands.fetch();
+  const current = commands.find((command) => command.name === "rank");
+  if (current) await current.edit(commandData);
+  else await guild.commands.create(commandData);
+  console.log("ランク操作コマンド登録完了: /rank");
+}
+
+async function rankEmployeeCandidates(search = "") {
+  const employeeSheet = await readEmployees();
+  const idColumn = employeeSheet.headerMap.get("社員ID");
+  const nameColumn = employeeSheet.headerMap.get("表示名");
+  const rankColumn = employeeSheet.headerMap.get("適用ランク");
+  const needle = String(search || "").trim().toLocaleLowerCase();
+  return employeeSheet.rows
+    .map((row) => ({
+      id: normalizedDiscordId(row, employeeSheet),
+      name: String(row[nameColumn] || "").trim(),
+      rank: String(row[rankColumn] || "？？？？").trim() || "？？？？",
+      employeeId: String(row[idColumn] || "").trim(),
+    }))
+    .filter((employee) => employee.id && employee.name && employee.rank !== "解雇者")
+    .filter((employee) => !needle || [employee.id, employee.employeeId, employee.name].some((value) => value.toLocaleLowerCase().includes(needle)))
+    .slice(0, 25);
+}
+
+function rankTargetMenu(candidates) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("rank:target")
+      .setPlaceholder("対象署員を選択")
+      .addOptions(candidates.map((employee) => new StringSelectMenuOptionBuilder()
+        .setLabel(truncateDiscord(employee.name, 100))
+        .setDescription(`${employee.rank} / ${employee.id}`.slice(0, 100))
+        .setValue(employee.id))),
+  );
+}
+
+async function handleRankCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const settings = await readRankOperationSettings();
+  if (!rankOperationPermission(interaction, settings)) {
+    await interaction.editReply("ランク操作の管理ロールが設定されていないか、実行権限がありません。");
+    return;
+  }
+  const candidates = await rankEmployeeCandidates(interaction.options.getString("search"));
+  if (!candidates.length) {
+    await interaction.editReply("該当する在籍署員がいません。検索条件を変えて再実行してください。");
+    return;
+  }
+  await interaction.editReply({
+    content: "対象署員を選択してください。解雇者は対象外です。",
+    components: [rankTargetMenu(candidates)],
+  });
+}
+
+async function handleRankTargetSelect(interaction) {
+  const discordId = interaction.values[0];
+  const [guild, rankMap] = await Promise.all([
+    client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
+    readRankMap(),
+  ]);
+  const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
+  const current = assessMember(member, rankMap).rankName || "？？？？";
+  const ranks = sortedRanks(rankMap).slice(0, 25);
+  await interaction.update({
+    content: `対象: **${truncateDiscord(member.displayName, 100)}**\n現在のランク: **${current}**\n変更後ランクを選択してください。`,
+    components: [new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`rank:next:${discordId}`)
+        .setPlaceholder("変更後ランクを選択")
+        .addOptions(ranks.map((rank) => new StringSelectMenuOptionBuilder()
+          .setLabel(truncateDiscord(rank.rankName, 100))
+          .setDescription(`ロール: ${rank.roleName}`.slice(0, 100))
+          .setValue(rank.rankName))),
+    )],
+  });
+}
+
+async function handleRankNextSelect(interaction, discordId) {
+  const nextRank = interaction.values[0];
+  await interaction.update({
+    content: `変更後ランク: **${truncateDiscord(nextRank, 100)}**\n理由を入力して実行してください。理由は必須です。`,
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(nextRank)}`)
+        .setLabel("理由を入力して実行")
+        .setStyle(ButtonStyle.Primary),
+    )],
+  });
+}
+
+async function handleRankReasonButton(interaction) {
+  const [, , discordId, encodedRank] = interaction.customId.split(":");
+  const modal = new ModalBuilder()
+    .setCustomId(`rank:submit:${discordId}:${encodedRank}`)
+    .setTitle("ランク変更理由");
+  const reason = new TextInputBuilder()
+    .setCustomId("reason")
+    .setLabel("変更理由（必須）")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(500)
+    .setPlaceholder("昇格・降格の理由を入力してください");
+  modal.addComponents(new ActionRowBuilder().addComponents(reason));
+  await interaction.showModal(modal);
+}
+
+async function handleRankSubmit(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const settings = await readRankOperationSettings();
+  if (!rankOperationPermission(interaction, settings)) throw new Error("ランク操作の管理ロールが設定されていないか、実行権限がありません。");
+  const [, , discordId, encodedRank] = interaction.customId.split(":");
+  const nextRank = decodeURIComponent(encodedRank);
+  const reason = String(interaction.fields.getTextInputValue("reason") || "").trim();
+  if (!reason) throw new Error("変更理由は必須です。");
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+  const [rankMap, employeeSheet] = await Promise.all([readRankMap(), readEmployees()]);
+  const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
+  const idColumn = employeeSheet.headerMap.get("社員ID");
+  const rowIndex = employeeSheet.rows.findIndex((row) => String(row[idColumn] || "").trim() === employeeId(discordId));
+  if (rowIndex < 0) throw new Error("対象者が従業員一覧に存在しません。最新の一覧を開き直してください。");
+  const currentRank = assessMember(member, rankMap).rankName || "？？？？";
+  const type = rankOperationType(rankMap, currentRank, nextRank);
+  const threadId = type === "昇格" ? settings.promotionThreadId : settings.demotionThreadId;
+  if (!/^\d{17,20}$/.test(threadId)) throw new Error(`${type}報告スレッドIDが未設定です。設定シートを確認してください。`);
+  const thread = await client.channels.fetch(threadId);
+  if (!thread?.isThread?.()) throw new Error(`${type}報告先がDiscordスレッドではありません。`);
+  const result = await applySelectedRank(guild, member, rankMap, nextRank, `Discord /rank: ${reason}`);
+  const rowNumber = rowIndex + 3;
+  await writeActionResult(employeeSheet, rowNumber, {
+    "適用ランク": nextRank,
+    "Discordロール": rankByName(rankMap, nextRank)?.roleName || nextRank,
+    "操作結果": `完了: ${result.transition} / ${reason}`,
+    "操作日時": new Date().toISOString(),
+  });
+  const report = await thread.send({
+    content: `【${type}報告】\n対象: <@${discordId}>\n変更: ${currentRank} → ${nextRank}\n理由: ${reason}\n実行者: <@${interaction.user.id}>`,
+    allowedMentions: { users: [discordId, interaction.user.id] },
+  });
+  const threadUrl = `https://discord.com/channels/${guildId}/${thread.id}/${report.id}`;
+  await appendStaffReport({
+    at: sheetDateTime(new Date()), discordId, name: member.displayName,
+    actorId: interaction.user.id, actorName: interaction.user.username,
+    previousRank: currentRank, nextRank, reason, type, threadUrl,
+    result: `完了: ${result.transition}`,
+  });
+  await interaction.editReply({ content: `${type}を実行しました。\n${threadUrl}` });
+}
+
 function canViewStaffProfile(interaction) {
   return Boolean(
     interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)
@@ -3114,8 +3342,30 @@ client.on("interactionCreate", async (interaction) => {
       await handleStaffProfileCommand(interaction);
       return;
     }
+    if (interaction.isChatInputCommand() && interaction.commandName === "rank") {
+      await handleRankCommand(interaction);
+      return;
+    }
     if (interaction.isChatInputCommand() && interaction.commandName === "mensetu") {
       await handleInterviewCommand(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === "rank:target") {
+      await interaction.deferUpdate();
+      await handleRankTargetSelect(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:next:")) {
+      await interaction.deferUpdate();
+      await handleRankNextSelect(interaction, interaction.customId.slice("rank:next:".length));
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("rank:reason:")) {
+      await handleRankReasonButton(interaction);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("rank:submit:")) {
+      await handleRankSubmit(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("iv:select:")) {
@@ -3158,9 +3408,10 @@ client.on("interactionCreate", async (interaction) => {
   } catch (error) {
     const quotaLimited = registerSheetsQuotaError(error);
     const isStaffProfileCommand = interaction.isChatInputCommand?.() && interaction.commandName === "syoin";
+    const isRankCommand = interaction.isChatInputCommand?.() && interaction.commandName === "rank";
     const message = quotaLimited
       ? `Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
-      : `${isStaffProfileCommand ? "署員個票" : "面接"}処理エラー: ${error.message || error}`;
+      : `${isStaffProfileCommand ? "署員個票" : isRankCommand ? "ランク操作" : "面接"}処理エラー: ${error.message || error}`;
     console.error(message);
     if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -3338,6 +3589,7 @@ client.once("clientReady", async () => {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
     await registerInterviewCommand(guild);
     await registerStaffProfileCommand(guild);
+    await registerRankCommand(guild);
   } catch (error) {
     console.error("Discordコマンド登録失敗:", error.message);
   }
