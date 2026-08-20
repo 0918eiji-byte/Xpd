@@ -3351,12 +3351,10 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId === "rank:target") {
-      await interaction.deferUpdate();
       await handleRankTargetSelect(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:next:")) {
-      await interaction.deferUpdate();
       await handleRankNextSelect(interaction, interaction.customId.slice("rank:next:".length));
       return;
     }
