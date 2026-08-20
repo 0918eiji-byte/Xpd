@@ -70,6 +70,7 @@ const unifiedSettingsBlocks = new Map([
   ["面接質問", [423, 1425]],
   ["連携", [1427, 1437]],
   ["ランク報告", [1437, 1446]],
+  ["操作ボード", [1447, 1452]],
 ]);
 let unifiedSettingsSheetId = null;
 let displayedSettingsCategory = "";
@@ -532,6 +533,10 @@ const onboardingSheetName = "採用手続き管理";
 const staffProfileSheetName = "署員個票";
 const staffProfileSheetId = 2090134610;
 const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1440:B1445`;
+const commandBoardConfigRange = `'${unifiedSettingsSheetName}'!A1448:B1452`;
+const commandBoardCooldownMs = 5000;
+const commandBoardCooldowns = new Map();
+const commandBoardLocks = new Set();
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1673,6 +1678,94 @@ async function readRankOperationSettings() {
   return { reportChannelId, managementRoleId, promotionThreadId, demotionThreadId, warningThreadId, reportThreadId };
 }
 
+async function readCommandBoardSettings() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: commandBoardConfigRange,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const values = response.data.values || [];
+  const map = new Map(values.map((row) => [String(row[0] || "").trim(), row[1]]));
+  return {
+    channelId: normalizedId(map.get("操作ボードチャンネルID")),
+    messageId: normalizedId(map.get("操作ボードメッセージID")),
+    enabled: isEnabledSetting(map.get("操作ボード有効")),
+  };
+}
+
+function commandBoardEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x1f4e79)
+    .setTitle("XPD管理 操作ボード")
+    .setDescription("各ボタンから機能を開始できます。権限のない機能は実行できません。\n連打防止のため、操作ボードのボタンは5秒に1回までです。")
+    .addFields(
+      { name: "面接（/mensetu）", value: "書類合格者を選択して面接を開始します。質問に回答後、投票へ進みます。", inline: false },
+      { name: "ランク操作（/rank）", value: "署員を選び、昇格・降格・警告・報告を実行します。備考は必須です。", inline: false },
+      { name: "署員個票（/syoin）", value: "自分の署員情報・ランク変更履歴・報告欄を表示します。", inline: false },
+    )
+    .setFooter({ text: "詳細検索が必要な場合は /mensetu・/rank・/syoin を使用してください" })
+    .setTimestamp();
+}
+
+function commandBoardComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("command:mensetu").setLabel("面接を開始").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("command:rank").setLabel("ランク操作").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("command:syoin").setLabel("署員個票").setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+async function ensureCommandBoard(guild) {
+  const settings = await readCommandBoardSettings();
+  if (!settings.enabled) {
+    console.log("操作ボード: 設定で無効です");
+    return;
+  }
+  let channelId = settings.channelId;
+  if (!/^\d{17,20}$/.test(channelId)) {
+    const interviewSettings = await readInterviewSettings();
+    channelId = interviewSettings.find((setting) => setting.enabled && /^\d{17,20}$/.test(setting.commandChannelId))?.commandChannelId || "";
+  }
+  if (!/^\d{17,20}$/.test(channelId)) throw new Error("操作ボードチャンネルIDが未設定です");
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel?.isTextBased?.() || channel.isThread?.()) throw new Error("操作ボードチャンネルIDが無効です");
+  const payload = { embeds: [commandBoardEmbed()], components: commandBoardComponents() };
+  let message = null;
+  if (/^\d{17,20}$/.test(settings.messageId)) message = await channel.messages.fetch(settings.messageId).catch(() => null);
+  if (message) await message.edit(payload);
+  else {
+    message = await channel.send(payload);
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `'${unifiedSettingsSheetName}'!B1451`,
+      valueInputOption: "RAW",
+      requestBody: { values: [[message.id]] },
+    });
+  }
+  console.log(`操作ボードを設置/更新: #${channel.name} (${message.id})`);
+}
+
+function commandBoardCooldownKey(interaction) {
+  return interaction.user.id;
+}
+
+function commandBoardCooldownRemaining(interaction) {
+  const key = commandBoardCooldownKey(interaction);
+  const remaining = (commandBoardCooldowns.get(key) || 0) - Date.now();
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+function consumeCommandBoardCooldown(interaction) {
+  const key = commandBoardCooldownKey(interaction);
+  const remaining = commandBoardCooldownRemaining(interaction);
+  if (remaining > 0) return remaining;
+  commandBoardCooldowns.set(key, Date.now() + commandBoardCooldownMs);
+  setTimeout(() => commandBoardCooldowns.delete(key), commandBoardCooldownMs + 1000).unref?.();
+  return 0;
+}
+
 async function validateRankReportDestinations(guild) {
   const settings = await readRankOperationSettings();
   if (!/^\d{17,20}$/.test(settings.reportChannelId)) throw new Error("ランク報告チャンネルIDが未設定です");
@@ -2723,7 +2816,7 @@ async function handleInterviewCommand(interaction) {
     });
     return;
   }
-  const search = interaction.options.getString("search") || "";
+  const search = interaction.options?.getString?.("search") || "";
   const candidates = await eligibleInterviewApplications(setting, search);
   if (!candidates.length) {
     await interaction.editReply(search
@@ -3292,7 +3385,7 @@ async function handleRankCommand(interaction) {
     await interaction.editReply("ランク操作の管理ロールが設定されていないか、実行権限がありません。");
     return;
   }
-  const candidates = await rankEmployeeCandidates(interaction.options.getString("search"));
+  const candidates = await rankEmployeeCandidates(interaction.options?.getString?.("search") || "");
   if (!candidates.length) {
     await interaction.editReply("該当する在籍署員がいません。検索条件を変えて再実行してください。");
     return;
@@ -3461,8 +3554,8 @@ async function handleStaffProfileCommand(interaction) {
     await interaction.editReply("署員個票はPolice Officerロールを持つ署員または管理者のみ検索できます。");
     return;
   }
-  const selectedUser = interaction.options.getUser("user");
-  const rawId = String(interaction.options.getString("id") || "").trim();
+  const selectedUser = interaction.options?.getUser?.("user") || null;
+  const rawId = String(interaction.options?.getString?.("id") || "").trim();
   if (selectedUser && rawId) {
     await interaction.editReply("user または id のどちらか一方だけを指定してください。");
     return;
@@ -3516,6 +3609,29 @@ async function enqueueInterviewInteraction(label, interaction, work) {
 client.on("interactionCreate", async (interaction) => {
   if (interaction.guildId !== guildId) return;
   try {
+    if (interaction.isButton() && interaction.customId.startsWith("command:")) {
+      const remaining = consumeCommandBoardCooldown(interaction);
+      if (remaining > 0) {
+        await interaction.reply({ content: `連打防止中です。${remaining}秒後にもう一度押してください。`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const lockKey = `${interaction.user.id}:${interaction.customId}`;
+      if (commandBoardLocks.has(lockKey)) {
+        await interaction.reply({ content: "現在処理中です。完了するまでお待ちください。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      commandBoardLocks.add(lockKey);
+      try {
+        const action = interaction.customId.slice("command:".length);
+        if (action === "mensetu") await handleInterviewCommand(interaction);
+        else if (action === "rank") await handleRankCommand(interaction);
+        else if (action === "syoin") await handleStaffProfileCommand(interaction);
+        else await interaction.reply({ content: "この操作ボードのボタンは無効です。管理者に確認してください。", flags: MessageFlags.Ephemeral });
+      } finally {
+        commandBoardLocks.delete(lockKey);
+      }
+      return;
+    }
     if (interaction.isChatInputCommand() && interaction.commandName === "syoin") {
       await handleStaffProfileCommand(interaction);
       return;
@@ -3590,9 +3706,10 @@ client.on("interactionCreate", async (interaction) => {
     const quotaLimited = registerSheetsQuotaError(error);
     const isStaffProfileCommand = interaction.isChatInputCommand?.() && interaction.commandName === "syoin";
     const isRankCommand = interaction.isChatInputCommand?.() && interaction.commandName === "rank";
+    const isCommandBoard = interaction.isButton?.() && interaction.customId?.startsWith("command:");
     const message = quotaLimited
       ? `Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
-      : `${isStaffProfileCommand ? "署員個票" : isRankCommand ? "ランク操作" : "面接"}処理エラー: ${formatDiscordIdError(error)}`;
+      : `${isCommandBoard ? "操作ボード" : isStaffProfileCommand ? "署員個票" : isRankCommand ? "ランク操作" : "面接"}処理エラー: ${formatDiscordIdError(error)}`;
     console.error(message);
     if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -3782,6 +3899,7 @@ client.once("clientReady", async () => {
     await registerInterviewCommand(guild);
     await registerStaffProfileCommand(guild);
     await registerRankCommand(guild);
+    await ensureCommandBoard(guild);
   } catch (error) {
     console.error("Discordコマンド登録失敗:", error.message);
   }
