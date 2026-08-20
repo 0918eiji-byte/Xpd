@@ -68,7 +68,8 @@ const unifiedSettingsBlocks = new Map([
   ["書類選考", [215, 317]],
   ["面接", [319, 421]],
   ["面接質問", [423, 1425]],
-  ["連携", [1427, 1529]],
+  ["連携", [1427, 1437]],
+  ["ランク報告", [1437, 1446]],
 ]);
 let unifiedSettingsSheetId = null;
 let displayedSettingsCategory = "";
@@ -512,7 +513,7 @@ const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
 const staffProfileSheetName = "署員個票";
 const staffProfileSheetId = 2090134610;
-const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1444`;
+const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1440:B1445`;
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1569,62 +1570,24 @@ async function readRankOperationSettings() {
   return { reportChannelId, managementRoleId, promotionThreadId, demotionThreadId, warningThreadId, reportThreadId };
 }
 
-async function ensureRankReportDestinations(guild) {
+async function validateRankReportDestinations(guild) {
   const settings = await readRankOperationSettings();
-  let channel = null;
-  if (/^\d{17,20}$/.test(settings.reportChannelId || "")) {
-    channel = await guild.channels.fetch(settings.reportChannelId).catch(() => null);
-  }
-  if (!channel) {
-    channel = guild.channels.cache.find((item) => item.type === ChannelType.GuildText && item.name === "ランク報告") || null;
-  }
-  if (!channel) {
-    channel = await guild.channels.create({
-      name: "ランク報告",
-      type: ChannelType.GuildText,
-      reason: "ランク操作報告チャンネルを自動作成",
-    });
-  }
-  if (channel.type !== ChannelType.GuildText || !channel.threads) {
-    throw new Error("ランク報告チャンネルは通常のテキストチャンネルにしてください");
-  }
-  await channel.threads.fetchActive().catch(() => null);
-  const threadNames = [
-    ["昇格", "promotionThreadId"],
-    ["降格", "demotionThreadId"],
-    ["警告", "warningThreadId"],
-    ["報告", "reportThreadId"],
-  ];
-  const threadIds = {};
-  for (const [name, key] of threadNames) {
-    let thread = channel.threads.cache.find((item) => item.name === name);
-    if (!thread) {
-      thread = await channel.threads.create({
-        name,
-        autoArchiveDuration: 1440,
-        reason: `ランク報告の${name}スレッドを自動作成`,
-      });
-    }
-    threadIds[key] = thread.id;
-  }
+  if (!/^\d{17,20}$/.test(settings.reportChannelId)) throw new Error("ランク報告チャンネルIDが未設定です");
+  const channel = await guild.channels.fetch(settings.reportChannelId).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildText) throw new Error("ランク報告チャンネルIDが無効です");
   const destinations = [
-    ["B1440", channel.id],
-    ["B1441", threadIds.promotionThreadId],
-    ["B1442", threadIds.demotionThreadId],
-    ["B1443", threadIds.warningThreadId],
-    ["B1444", threadIds.reportThreadId],
+    ["昇格", settings.promotionThreadId],
+    ["降格", settings.demotionThreadId],
+    ["警告", settings.warningThreadId],
+    ["報告", settings.reportThreadId],
   ];
-  const current = [settings.reportChannelId, settings.promotionThreadId, settings.demotionThreadId, settings.warningThreadId, settings.reportThreadId];
-  const updates = destinations.filter(([, id], index) => current[index] !== id)
-    .map(([cell, id]) => ({ range: `'${unifiedSettingsSheetName}'!${cell}`, values: [[discordIdCell(id)]] }));
-  if (updates.length > 0) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
-    });
+  for (const [name, threadId] of destinations) {
+    if (!/^\d{17,20}$/.test(threadId)) throw new Error(`${name}報告スレッドIDが未設定です`);
+    const thread = await guild.channels.fetch(threadId).catch(() => null);
+    if (!thread?.isThread?.() || thread.parentId !== channel.id) throw new Error(`${name}報告スレッドがチャンネル設定と一致しません`);
   }
-  console.log(`ランク報告先を確認: #${channel.name} / ${threadNames.map(([name]) => name).join("・")}`);
-  return { channel, threadIds };
+  console.log(`ランク報告先を確認: #${channel.name} / ${destinations.map(([name]) => name).join("・")}`);
+  return { channel };
 }
 
 function rankOperationPermission(interaction, settings) {
@@ -3705,7 +3668,7 @@ client.once("clientReady", async () => {
   }
   try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
-    await ensureRankReportDestinations(guild);
+    await validateRankReportDestinations(guild);
   } catch (error) {
     console.error("ランク報告先の自動準備失敗:", error.message);
   }
