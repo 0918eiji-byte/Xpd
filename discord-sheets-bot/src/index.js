@@ -634,6 +634,31 @@ async function readEmployees() {
   if (missingHeaders.length) {
     const start = Math.max(headers.length, 1);
     const end = start + missingHeaders.length - 1;
+    const metadata = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets.properties(sheetId,title,gridProperties.columnCount)",
+    });
+    const sheet = metadata.data.sheets?.find((item) => item.properties?.title === employeeSheetName);
+    const currentColumnCount = Number(sheet?.properties?.gridProperties?.columnCount || 0);
+    const requiredColumnCount = end + 1;
+    if (currentColumnCount < requiredColumnCount) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [{
+            insertDimension: {
+              range: {
+                sheetId: employeeSheetId,
+                dimension: "COLUMNS",
+                startIndex: currentColumnCount,
+                endIndex: requiredColumnCount,
+              },
+              inheritFromBefore: true,
+            },
+          }],
+        },
+      });
+    }
     await sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `'${employeeSheetName}'!${columnLetter(start)}2:${columnLetter(end)}2`,
