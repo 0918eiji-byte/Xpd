@@ -1777,6 +1777,21 @@ async function ensureCommandBoard(guild, kind, channelId, messageId, enabled) {
       requestBody: { values: [[message.id]] },
     });
   }
+  // Keep exactly one board for each configured channel. Older deployments could
+  // have left duplicate bot-authored boards behind; remove only messages that
+  // match this board title and never remove the configured/current message.
+  const boardTitle = commandBoardEmbed(kind).data.title;
+  const recent = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (recent) {
+    const duplicates = recent.filter((candidate) => (
+      candidate.id !== message.id
+      && candidate.author?.id === client.user?.id
+      && candidate.embeds?.some((embed) => embed.title === boardTitle)
+    ));
+    for (const duplicate of duplicates.values()) {
+      await duplicate.delete().catch((error) => console.warn(`${interview ? "面接" : "ランク管理"}ボード重複削除失敗 (${duplicate.id}):`, error.message));
+    }
+  }
   commandBoardChannels.set(interview ? "mensetu" : "rank", channel.id);
   if (!interview) commandBoardChannels.set("syoin", channel.id);
   console.log(`${interview ? "面接" : "ランク管理"}ボードを設置/更新: #${channel.name} (${message.id})`);
