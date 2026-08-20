@@ -799,18 +799,12 @@ async function syncMember(member, context = null) {
       : "");
     await upsertTerminationRecord(member, previousRank);
     if (index >= 0) {
-      await applyEmployeeUpdates(
-        rowUpdate(employeeSheet, targetRow, {
-          "表示名": member.displayName,
-          "Discordロール": dismissal.roleName,
-          "適用ランク": previousRank,
-          [sortPriorityHeader]: 10000,
-        }),
-        context,
-      );
+      // 解雇者は従業員一覧には残さず、解雇者管理だけを正とする。
+      // 解除予定日まで解雇者管理に保持し、名簿側は検知時点で即時クリアする。
+      await clearEmployeeRow(employeeSheet, targetRow, context);
     }
     lastSynchronizedRanks.set(member.id, "解雇");
-    logMemberSync(context, `解雇者ロール検知: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
+    logMemberSync(context, `解雇者を従業員一覧から除外: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
     return;
   }
 
