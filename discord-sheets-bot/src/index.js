@@ -566,6 +566,14 @@ async function ensureRankAndEmployeeValidation() {
   const enabledRankNames = rankRows
     .filter((row) => isEnabledSetting(row?.[5]) && String(row?.[1] || "").trim())
     .map((row) => String(row[1]).trim());
+  const employeeIdColumn = employeeSheet.headerMap.get("社員ID");
+  const employeeNameColumn = employeeSheet.headerMap.get("表示名");
+  const profileOptions = employeeSheet.rows
+    .filter((row) => String(row?.[employeeIdColumn] || "").trim() && String(row?.[employeeNameColumn] || "").trim())
+    .slice(0, 500)
+    .map((row) => ({
+      userEnteredValue: `${String(row[employeeIdColumn]).trim()}｜${String(row[employeeNameColumn]).trim()}`.slice(0, 90),
+    }));
   const rankColumn = employeeSheet.headerMap.get(rankSelectionHeader);
   const triggerColumn = employeeSheet.headerMap.get(actionTriggerHeader);
   const requests = [
@@ -596,6 +604,14 @@ async function ensureRankAndEmployeeValidation() {
       setDataValidation: {
         range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: triggerColumn, endColumnIndex: triggerColumn + 1 },
         rule: { condition: { type: "BOOLEAN" }, strict: true, showCustomUi: true },
+      },
+    });
+  }
+  if (profileOptions.length) {
+    requests.push({
+      setDataValidation: {
+        range: { sheetId: staffProfileSheetId, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 4 },
+        rule: { condition: { type: "ONE_OF_LIST", values: profileOptions }, strict: false, showCustomUi: true },
       },
     });
   }
