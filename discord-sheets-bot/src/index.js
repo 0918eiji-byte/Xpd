@@ -493,6 +493,7 @@ const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ラン�
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
+const employeeSheetName = "署員一覧";
 const retentionPeriodMs = 7 * 24 * 60 * 60 * 1000;
 const bonusDistributionSheetName = "ボーナス配布";
 const bonusDistributionSheetId = 1863429017;
@@ -521,7 +522,7 @@ const interviewPollIntervalMs = Math.max(Number(process.env.INTERVIEW_POLL_INTER
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: "'従業員'!A2:ZZ1000",
+    range: `'${employeeSheetName}'!A2:ZZ1000`,
   });
   const values = response.data.values || [];
   let headers = values[0] || [];
@@ -539,7 +540,7 @@ async function readEmployees() {
     const end = start + missingHeaders.length - 1;
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `'従業員'!${columnLetter(start)}2:${columnLetter(end)}2`,
+      range: `'${employeeSheetName}'!${columnLetter(start)}2:${columnLetter(end)}2`,
       valueInputOption: "RAW",
       requestBody: { values: [missingHeaders] },
     });
@@ -562,9 +563,9 @@ async function readEmployees() {
 
 function cellRange(employeeSheet, header, rowNumber) {
   const index = employeeSheet.headerMap.get(header);
-  if (index === undefined) throw new Error(`従業員シートに「${header}」列がありません。`);
+  if (index === undefined) throw new Error(`${employeeSheetName}シートに「${header}」列がありません。`);
   const col = columnLetter(index);
-  return `'従業員'!${col}${rowNumber}`;
+  return `'${employeeSheetName}'!${col}${rowNumber}`;
 }
 
 function rowUpdate(employeeSheet, rowNumber, fields) {
@@ -707,7 +708,7 @@ async function sortEmployees(employeeSheet) {
   const priorityColumn = employeeSheet.headerMap.get(sortPriorityHeader);
   const nameColumn = employeeSheet.headerMap.get("表示名");
   if (priorityColumn === undefined || nameColumn === undefined) {
-    throw new Error("従業員シートの並び替え用見出しが見つかりません");
+    throw new Error(`${employeeSheetName}シートの並び替え用見出しが見つかりません`);
   }
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
@@ -746,7 +747,7 @@ async function sortEmployees(employeeSheet) {
 }
 
 async function clearEmployeeRow(employeeSheet, rowNumber, context = null) {
-  const range = `'従業員'!A${rowNumber}:ZZ${rowNumber}`;
+  const range = `'${employeeSheetName}'!A${rowNumber}:ZZ${rowNumber}`;
   if (context?.pendingClearRanges) {
     context.pendingClearRanges.push(range);
     return;
@@ -801,12 +802,12 @@ async function syncMember(member, context = null) {
       : "");
     await upsertTerminationRecord(member, previousRank);
     if (index >= 0) {
-      // 解雇者は従業員一覧には残さず、解雇者管理だけを正とする。
+      // 解雇者は署員一覧には残さず、解雇者管理だけを正とする。
       // 解除予定日まで解雇者管理に保持し、名簿側は検知時点で即時クリアする。
       await clearEmployeeRow(employeeSheet, targetRow, context);
     }
     lastSynchronizedRanks.set(member.id, "解雇");
-    logMemberSync(context, `解雇者を従業員一覧から除外: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
+    logMemberSync(context, `解雇者を署員一覧から除外: ${member.displayName}${previousRank ? ` (最終ランク: ${previousRank})` : ""}`);
     return;
   }
 
@@ -896,7 +897,7 @@ async function consolidateEmployeeDuplicates() {
   await sheets.spreadsheets.values.batchClear({
     spreadsheetId,
     requestBody: {
-      ranges: uniqueDuplicateIndexes.map((index) => `'従業員'!A${index + 3}:ZZ${index + 3}`),
+      ranges: uniqueDuplicateIndexes.map((index) => `'${employeeSheetName}'!A${index + 3}:ZZ${index + 3}`),
     },
   });
   await sortEmployees(employeeSheet);
@@ -1103,7 +1104,7 @@ async function processBonusDistribution() {
   if (!isChecked(top[10])) return;
 
   try {
-    await writeBonusTop({ N4: "処理中: 従業員を読込中" });
+    await writeBonusTop({ N4: "処理中: 署員一覧を読込中" });
     if (!roundName) throw new Error("表示回を選択してください");
     const poolAmount = Number(top[7]);
     if (!Number.isFinite(poolAmount) || poolAmount <= 0) {
@@ -1134,7 +1135,7 @@ async function processBonusDistribution() {
       }))
       .filter((employee) => employee.employeeId && employee.name
         && employee.rank !== "解雇者" && !employee.roles.includes("解雇者"));
-    if (!employees.length) throw new Error("従業員ページに読込対象がいません");
+    if (!employees.length) throw new Error("署員一覧に読込対象がいません");
 
     const ledgerRows = ledgerResponse.data.values || [];
     const oldRoundRows = [];
@@ -1509,7 +1510,7 @@ async function staffProfile(discordId) {
   const idColumn = employeeSheet.headerMap.get("社員ID");
   const matchingRows = employeeSheet.rows.filter((item) => String(item[idColumn] || "").trim() === employeeId(discordId));
   if (!matchingRows.length) return null;
-  if (matchingRows.length > 1) throw new Error(`社員ID ${employeeId(discordId)} が従業員名簿で重複しています。管理者が名簿を確認してください。`);
+  if (matchingRows.length > 1) throw new Error(`社員ID ${employeeId(discordId)} が署員一覧で重複しています。管理者が一覧を確認してください。`);
   const [row] = matchingRows;
   const value = (header) => {
     const column = employeeSheet.headerMap.get(header);
@@ -1545,7 +1546,7 @@ function staffProfileEmbed(profile, member) {
       { name: "報告欄", value: truncateDiscord(profile.report || "報告なし", 1024) },
       { name: "最終操作", value: truncateDiscord([profile.operationResult, profile.operationAt].filter(Boolean).join("｜") || "履歴なし", 1024) },
     )
-    .setFooter({ text: "従業員名簿の現在値を表示しています" })
+    .setFooter({ text: "署員一覧の現在値を表示しています" })
     .setTimestamp();
 }
 
@@ -3241,7 +3242,7 @@ async function handleRankSubmit(interaction) {
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
   const idColumn = employeeSheet.headerMap.get("社員ID");
   const rowIndex = employeeSheet.rows.findIndex((row) => String(row[idColumn] || "").trim() === employeeId(discordId));
-  if (rowIndex < 0) throw new Error("対象者が従業員一覧に存在しません。最新の一覧を開き直してください。");
+  if (rowIndex < 0) throw new Error("対象者が署員一覧に存在しません。最新の一覧を開き直してください。");
   const currentRank = assessMember(member, rankMap).rankName || "？？？？";
   const type = rankOperationType(rankMap, currentRank, nextRank);
   const threadId = type === "昇格" ? settings.promotionThreadId : settings.demotionThreadId;
@@ -3301,7 +3302,7 @@ async function handleStaffProfileCommand(interaction) {
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
   ]);
   if (!profile) {
-    await interaction.editReply(`ID \`${discordId}\` は現在の従業員名簿に見つかりません。`);
+    await interaction.editReply(`ID \`${discordId}\` は現在の署員一覧に見つかりません。`);
     return;
   }
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
@@ -3491,7 +3492,7 @@ async function processTerminations() {
       return (discordId && candidateDiscordId === discordId)
         || String(employeeRow[employeeIdColumn] || "").trim() === terminatedEmployeeId;
     });
-    if (employeeIndex >= 0) employeeRangesToClear.push(`'従業員'!A${employeeIndex + 3}:ZZ${employeeIndex + 3}`);
+    if (employeeIndex >= 0) employeeRangesToClear.push(`'${employeeSheetName}'!A${employeeIndex + 3}:ZZ${employeeIndex + 3}`);
     terminationRangesToClear.push(`'${terminationSheetName}'!A${rowNumber}:I${rowNumber}`);
     terminationRangesToClear.push(`'${terminationSheetName}'!K${rowNumber}:K${rowNumber}`);
     console.log(`解雇者記録を自動削除: ${terminatedEmployeeId}`);
@@ -3601,7 +3602,7 @@ client.once("clientReady", async () => {
       }
       const jobs = [
         ["統合設定監査", auditUnifiedSettings],
-        ["従業員操作", processSheetActions],
+        ["署員一覧操作", processSheetActions],
         ["ボーナス配布", processBonusDistribution],
         ["書類選考", processRecruitmentApplications],
         ["面接", processInterviewPolls],
