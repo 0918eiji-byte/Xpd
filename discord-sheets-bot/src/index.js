@@ -88,6 +88,21 @@ function normalizedId(value) {
   return String(value ?? "").replace(/^'+/, "").replace(/[\s`]/g, "").trim();
 }
 
+function isEnabledSetting(value) {
+  if (value === true || value === 1) return true;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["true", "はい", "yes", "有効", "1", "✓"].includes(normalized);
+}
+
+function formatDiscordIdError(error, discordId = "") {
+  const raw = String(error?.response?.data?.message || error?.message || error || "");
+  const code = Number(error?.code || error?.rawError?.code || error?.response?.data?.code || 0);
+  if ([10004, 10007, 10013].includes(code) || /unknown (member|user|guild)|unknown member|unknown user/i.test(raw)) {
+    return `Discord IDが違います${discordId ? `（${discordId}）` : ""}。Discordサーバーに存在するユーザーIDを確認してください。`;
+  }
+  return raw;
+}
+
 function duplicateValues(values) {
   const seen = new Set();
   const duplicates = new Set();
@@ -124,7 +139,7 @@ async function auditUnifiedSettings(force = false) {
     const [rankRows, bonusRows, recruitmentRows, interviewRows, questionRows] = ranges.slice(2).map((range) => range.values || []);
     const errors = [];
     const snowflake = /^\d{17,20}$/;
-    const activeRanks = rankRows.filter((row) => String(row[5] || "").trim() === "はい");
+    const activeRanks = rankRows.filter((row) => isEnabledSetting(row[5]));
     for (const row of activeRanks) {
       if (!String(row[1] || "").trim() || !snowflake.test(normalizedId(row[2]))) errors.push("ランク名またはロールIDが不正");
       if (!Number.isFinite(Number(row[0])) || !Number.isFinite(Number(row[4]))) errors.push("ランク優先度またはボーナス係数が不正");
@@ -263,8 +278,10 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
 });
 
-let queue = Promise.resolve();
-let interviewQueue = Promise.resolve();
+// Keep background Sheets work isolated from user-facing Discord operations.
+// A slow polling/synchronization job must never delay an interaction response.
+let sheetsQueue = Promise.resolve();
+let discordOperationQueue = Promise.resolve();
 const lastSynchronizedRanks = new Map();
 let sheetsQuotaBackoffUntil = 0;
 let sheetsQuotaBackoffLevel = 0;
@@ -288,20 +305,20 @@ function sheetsBackoffRemainingSeconds() {
   return Math.max(0, Math.ceil((sheetsQuotaBackoffUntil - Date.now()) / 1000));
 }
 
-function enqueue(label, work) {
-  queue = queue.then(work).catch((error) => {
+function enqueueSheets(label, work) {
+  sheetsQueue = sheetsQueue.then(work).catch((error) => {
     const message = error.response?.data?.error?.message || error.message || error;
     console.error(`[${label}]`, message);
   });
-  return queue;
+  return sheetsQueue;
 }
 
-function enqueueInterview(label, work) {
-  interviewQueue = interviewQueue.then(work).catch((error) => {
+function enqueueDiscordOperation(label, work) {
+  discordOperationQueue = discordOperationQueue.then(work).catch((error) => {
     const message = error.response?.data?.error?.message || error.message || error;
     console.error(`[${label}]`, message);
   });
-  return interviewQueue;
+  return discordOperationQueue;
 }
 
 async function readRankMap() {
@@ -316,7 +333,7 @@ async function readRankMap() {
     const rankName = String(row[1] || "").trim();
     const roleId = normalizedId(row[2]);
     const roleName = String(row[3] || rankName).trim();
-    const enabled = String(row[5] || "") === "はい";
+    const enabled = isEnabledSetting(row[5]);
     if (enabled && roleId && rankName) map.set(roleId, { roleId, priority, rankName, roleName });
   }
   return map;
@@ -491,7 +508,8 @@ const legacyActionTriggerHeader = "実行";
 const sortPriorityHeader = "階級順序";
 const bonusFactorHeader = "ランク係数";
 const legacyBonusFactorHeader = "固定係数";
-const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", bonusFactorHeader, rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader];
+const currentStatusHeader = "現在状態";
+const botHeaders = ["社員ID", "表示名", "Discordロール", "適用ランク", bonusFactorHeader, rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", currentStatusHeader, sortPriorityHeader];
 const terminationHeaders = ["社員ID", "表示名", "DiscordユーザーID", "最終ランク", "解雇日", "手続き完了", "対応署員", "完了日", "名簿削除予定日", "名簿削除状況", "備考"];
 const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
@@ -521,6 +539,75 @@ const onboardingHeaders = [
 ];
 let lastInterviewPollAt = 0;
 const interviewPollIntervalMs = Math.max(Number(process.env.INTERVIEW_POLL_INTERVAL_MS || 60000), 30000);
+let lastRankValidationAt = 0;
+
+async function ensureRankAndEmployeeValidation() {
+  if (Date.now() - lastRankValidationAt < 10 * 60 * 1000) return;
+  const employeeSheet = await readEmployees();
+  const rankRows = unifiedSettingsSnapshot?.rank || (await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${unifiedSettingsSheetName}'!A10:F109`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  })).data.values || [];
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets.properties(sheetId,title)",
+  });
+  const settingsSheetId = metadata.data.sheets?.find((item) => item.properties?.title === unifiedSettingsSheetName)?.properties?.sheetId;
+  if (settingsSheetId === undefined || settingsSheetId === null) throw new Error("設定シートが見つかりません");
+  const rankEnabledValues = Array.from({ length: 100 }, (_, index) => [isEnabledSetting(rankRows[index]?.[5])]);
+  const rankCandidateFormulas = Array.from({ length: 100 }, (_, index) => [`=IF(OR($F${index + 10}=TRUE,$F${index + 10}=\"はい\"),$B${index + 10},\"\")`]);
+  const enabledRankNames = rankRows
+    .filter((row) => isEnabledSetting(row?.[5]) && String(row?.[1] || "").trim())
+    .map((row) => String(row[1]).trim());
+  const rankColumn = employeeSheet.headerMap.get(rankSelectionHeader);
+  const triggerColumn = employeeSheet.headerMap.get(actionTriggerHeader);
+  const requests = [
+    {
+      setDataValidation: {
+        range: { sheetId: settingsSheetId, startRowIndex: 9, endRowIndex: 109, startColumnIndex: 5, endColumnIndex: 6 },
+        rule: { condition: { type: "BOOLEAN" }, strict: true, showCustomUi: true },
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId: settingsSheetId, dimension: "COLUMNS", startIndex: 6, endIndex: 7 },
+        properties: { hiddenByUser: true },
+        fields: "hiddenByUser",
+      },
+    },
+  ];
+  if (rankColumn !== undefined) {
+    requests.push({
+      setDataValidation: {
+        range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: rankColumn, endColumnIndex: rankColumn + 1 },
+        rule: { condition: { type: "ONE_OF_LIST", values: enabledRankNames.map((value) => ({ userEnteredValue: value })) }, strict: false, showCustomUi: true },
+      },
+    });
+  }
+  if (triggerColumn !== undefined) {
+    requests.push({
+      setDataValidation: {
+        range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: triggerColumn, endColumnIndex: triggerColumn + 1 },
+        rule: { condition: { type: "BOOLEAN" }, strict: true, showCustomUi: true },
+      },
+    });
+  }
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: [
+        { range: `'${unifiedSettingsSheetName}'!F10:F109`, values: rankEnabledValues },
+        { range: `'${unifiedSettingsSheetName}'!G9`, values: [["有効ランク候補（自動）"]] },
+        { range: `'${unifiedSettingsSheetName}'!G10:G109`, values: rankCandidateFormulas },
+      ],
+    },
+  });
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+  lastRankValidationAt = Date.now();
+  console.log("ランク設定の有効チェックボックスと署員一覧のランクプルダウンを更新しました");
+}
 
 async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
@@ -865,7 +952,7 @@ async function consolidateEmployeeDuplicates() {
 
   const systemHeaders = new Set([
     "社員ID", "表示名", "Discordロール", "適用ランク",
-    "基本ボーナス", bonusFactorHeader, legacyBonusFactorHeader, "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", sortPriorityHeader,
+    "基本ボーナス", bonusFactorHeader, legacyBonusFactorHeader, "調整額", "見込ボーナス", rankSelectionHeader, actionTriggerHeader, "操作結果", "操作日時", currentStatusHeader, sortPriorityHeader,
   ]);
   const mergeHeaders = employeeSheet.headers.filter((header) => header && !systemHeaders.has(String(header)));
   const mergeData = [];
@@ -938,12 +1025,16 @@ async function processSheetActions() {
     if (!discordId && triggered) {
       await writeActionResult(employeeSheet, rowNumber, {
         [actionTriggerHeader]: false,
-        "操作結果": "エラー: 社員IDからDiscordユーザーIDを判別できません",
+        "操作結果": "エラー: 社員IDからDiscordユーザーIDを判別できません（IDが違います）",
+        [currentStatusHeader]: "要確認: Discord IDが違います",
         "操作日時": new Date().toISOString(),
       });
       continue;
     }
-    if (!discordId) continue;
+    if (!discordId) {
+      await writeActionResult(employeeSheet, rowNumber, { [currentStatusHeader]: "対象外: Discord ID未登録" });
+      continue;
+    }
 
     try {
       const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
@@ -954,7 +1045,7 @@ async function processSheetActions() {
 
       if (triggered) {
         const selectedRank = String(row[targetColumn] || "").trim();
-        await writeActionResult(employeeSheet, rowNumber, { "操作結果": `処理中: ${selectedRank || "未選択"}` });
+        await writeActionResult(employeeSheet, rowNumber, { "操作結果": `処理中: ${selectedRank || "未選択"}`, [currentStatusHeader]: "処理中" });
         if (!selectedRank) throw new Error("変更後ランクを選択してください");
         const result = await applySelectedRank(guild, member, rankMap, selectedRank, "Google Sheetsの統合操作");
         await syncMember(await guild.members.fetch(discordId));
@@ -963,6 +1054,7 @@ async function processSheetActions() {
           [rankSelectionHeader]: "",
           [actionTriggerHeader]: false,
           "操作結果": `完了: ${result.transition}`,
+          [currentStatusHeader]: `在籍中: ${result.transition.split(" → ").at(-1) || "同期済み"}`,
           "操作日時": new Date().toISOString(),
         });
         console.log(`シート操作完了: ${member.displayName} ${result.transition}`);
@@ -971,12 +1063,14 @@ async function processSheetActions() {
 
       if (discordRank === "解雇") {
         lastSynchronizedRanks.set(discordId, discordRank);
+        await writeActionResult(employeeSheet, rowNumber, { [currentStatusHeader]: "解雇者管理へ移管済み" });
         continue;
       }
 
       const sheetRank = String(row[appliedRankColumn] || "").trim();
       if (!sheetRank || sheetRank === discordRank) {
         lastSynchronizedRanks.set(discordId, discordRank);
+        await writeActionResult(employeeSheet, rowNumber, { [currentStatusHeader]: `在籍中: ${discordRank}` });
         continue;
       }
 
@@ -987,6 +1081,7 @@ async function processSheetActions() {
         needsSort = true;
         await writeActionResult(employeeSheet, rowNumber, {
           "操作結果": `完了: スプシ → Discord (${result.transition})`,
+          [currentStatusHeader]: `在籍中: ${sheetRank}`,
           "操作日時": new Date().toISOString(),
         });
         console.log(`双方向同期: スプシ → Discord ${member.displayName} ${result.transition}`);
@@ -995,15 +1090,17 @@ async function processSheetActions() {
         needsSort = true;
         await writeActionResult(employeeSheet, rowNumber, {
           "操作結果": `完了: Discord → スプシ (${discordRank})`,
+          [currentStatusHeader]: `在籍中: ${discordRank}`,
           "操作日時": new Date().toISOString(),
         });
         console.log(`双方向同期: Discord → スプシ ${member.displayName} ${discordRank}`);
       }
     } catch (error) {
-      const message = error.response?.data?.message || error.message || String(error);
+      const message = formatDiscordIdError(error, discordId);
       await writeActionResult(employeeSheet, rowNumber, {
         [actionTriggerHeader]: false,
         "操作結果": `エラー: ${message}`,
+        [currentStatusHeader]: /Discord IDが違います/.test(message) ? "要確認: Discord IDが違います" : `処理失敗: ${message}`,
         "操作日時": new Date().toISOString(),
       });
       console.error(`シート操作失敗: ${discordId}`, message);
@@ -1063,10 +1160,16 @@ async function saveBonusRoundSetting(roundName, poolAmount, loadedAt) {
     range: `'${bonusRoundSettingsSheetName}'!A2:C100`,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
-  const rows = unified?.rows || response.data.values || [];
+  // values.get omits trailing empty rows.  The unified block is a fixed
+  // 100-row area (A114:C213), so pad the snapshot before looking for the
+  // first available row.  Without this, a valid new round was incorrectly
+  // treated as a full 100-row block and produced the old upper-limit error.
+  const rows = [...(unified?.rows || response.data.values || [])];
+  const maxRows = unified ? 100 : 99;
+  while (rows.length < maxRows) rows.push([]);
   let index = rows.findIndex((row) => String(row[0] || "").trim() === roundName);
   if (index < 0) index = rows.findIndex((row) => !String(row[0] || "").trim());
-  if (index < 0 || (unified && index >= 100)) throw new Error("ボーナス回設定が上限100件に達しています");
+  if (index < 0 || index >= maxRows) throw new Error("ボーナス回設定が上限に達しています");
   const rowNumber = index + (unified?.firstRow || 2);
   const sheetName = unified ? unifiedSettingsSheetName : bonusRoundSettingsSheetName;
   await sheets.spreadsheets.values.update({
@@ -1078,7 +1181,7 @@ async function saveBonusRoundSetting(roundName, poolAmount, loadedAt) {
 }
 
 function bonusLedgerRow(rowNumber, roundName, employee, loadedAt, existingRow = null) {
-  const basicPay = `=IF(B${rowNumber}="","",IF(SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000)=0,0,ROUNDDOWN(IF('設定'!$K$3="v2:READY",IFNA(XLOOKUP($L${rowNumber},'設定'!$A$114:$A$213,'設定'!$B$114:$B$213),0),IFNA(XLOOKUP($L${rowNumber},'${bonusRoundSettingsSheetName}'!$A$2:$A$100,'${bonusRoundSettingsSheetName}'!$B$2:$B$100),0))*E${rowNumber}/SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000),-7)))`;
+  const basicPay = `=IF(B${rowNumber}="","",IF(SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000)=0,0,ROUNDDOWN(IFNA(XLOOKUP($L${rowNumber},'設定'!$A$114:$A$213,'設定'!$B$114:$B$213),0)*E${rowNumber}/SUMIF($L$12:$L$1000,$L${rowNumber},$E$12:$E$1000),-7)))`;
   return [
     sheetDateTime(loadedAt).slice(0, 10),
     employee.employeeId,
@@ -2366,7 +2469,8 @@ async function eligibleInterviewApplications(setting, search = "") {
   )).filter(Boolean));
   const needle = String(search || "").trim().toLowerCase();
   const candidates = applications.filter((application) => (
-    application.pollStatus === "FINAL"
+    application.roundName === setting.roundName
+    && application.pollStatus === "FINAL"
     && application.verdict === "合格"
     && application.passAnnouncementMessageId
     && application.documentRoleStatus.startsWith("書類合格ロール付与済")
@@ -3013,14 +3117,10 @@ async function processInterviewPolls() {
     readRecruitmentSettings(),
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
   ]);
-  const configuredRounds = new Set(settings.map((setting) => setting.roundName).filter(Boolean));
-  for (const [settingIndex, setting] of settings.entries()) {
-    // 未設定の募集回は、最初の有効な面接設定を共通設定として使用する。
-    // 募集回を増やすたびに面接設定を複製しなくても、既存の面接待ちを処理できる。
-    const targetRecords = records.filter((record) => (
-      record.roundName === setting.roundName
-      || (settingIndex === 0 && !configuredRounds.has(record.roundName))
-    ));
+  for (const setting of settings) {
+    // 面接設定と同じ募集回だけを処理する。別回の設定を流用すると、
+    // 投票先・発表先・締切条件が別回へ誤適用されるため許可しない。
+    const targetRecords = records.filter((record) => record.roundName === setting.roundName);
     let updatedCount = 0;
     let announcedCount = 0;
     for (const record of targetRecords) {
@@ -3379,19 +3479,19 @@ async function handleStaffProfileCommand(interaction) {
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
   ]);
   if (!profile) {
-    await interaction.editReply(`ID \`${discordId}\` は現在の署員一覧に見つかりません。`);
+    await interaction.editReply(`ID \`${discordId}\` は現在の署員一覧に見つかりません。Discord IDが違います、または署員一覧が未同期です。`);
     return;
   }
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
   if (!member) {
-    await interaction.editReply(`名簿には登録されていますが、Discordサーバー上で ID \`${discordId}\` を確認できません。`);
+    await interaction.editReply(`名簿には登録されていますが、Discordサーバー上で ID \`${discordId}\` を確認できません。Discord IDが違います。`);
     return;
   }
   await interaction.editReply({ embeds: [staffProfileEmbed(profile, member)] });
 }
 
 async function enqueueInterviewInteraction(label, interaction, work) {
-  await enqueueInterview(label, async () => {
+  await enqueueDiscordOperation(label, async () => {
     try {
       await work();
     } catch (error) {
@@ -3492,7 +3592,7 @@ client.on("interactionCreate", async (interaction) => {
     const isRankCommand = interaction.isChatInputCommand?.() && interaction.commandName === "rank";
     const message = quotaLimited
       ? `Google Sheetsの読込制限が解除される約${sheetsBackoffRemainingSeconds()}秒後に、もう一度実行してください。`
-      : `${isStaffProfileCommand ? "署員個票" : isRankCommand ? "ランク操作" : "面接"}処理エラー: ${error.message || error}`;
+      : `${isStaffProfileCommand ? "署員個票" : isRankCommand ? "ランク操作" : "面接"}処理エラー: ${formatDiscordIdError(error)}`;
     console.error(message);
     if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -3667,6 +3767,11 @@ client.once("clientReady", async () => {
     console.error("統合設定の起動時監査失敗:", error.message);
   }
   try {
+    await ensureRankAndEmployeeValidation();
+  } catch (error) {
+    console.error("ランク設定・署員一覧の入力規則更新失敗:", error.message);
+  }
+  try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
     await validateRankReportDestinations(guild);
   } catch (error) {
@@ -3683,7 +3788,7 @@ client.once("clientReady", async () => {
   const actionPollInterval = Math.max(Number(process.env.ACTION_POLL_INTERVAL_MS || 30000), 30000);
   const initialPollDelay = Math.max(actionPollInterval, 60000);
   const pollSheetActions = async () => {
-    await enqueue("シート操作・応募・退職処理", async () => {
+    await enqueueSheets("シート操作・応募・退職処理", async () => {
       if (Date.now() < sheetsQuotaBackoffUntil) {
         console.log(`Google Sheets読込待機中: 残り約${sheetsBackoffRemainingSeconds()}秒`);
         return;
@@ -3724,7 +3829,7 @@ client.once("clientReady", async () => {
     }
     setTimeout(pollSettingsView, 10000);
   };
-  enqueue("起動時全件同期", fullSync)
+  enqueueSheets("起動時全件同期", fullSync)
     .finally(() => {
       setTimeout(pollSheetActions, initialPollDelay);
       setTimeout(pollSettingsView, 10000);
@@ -3734,15 +3839,15 @@ client.once("clientReady", async () => {
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
   console.log(`面接投票確認: ${interviewPollIntervalMs}ms間隔`);
 });
-client.on("guildMemberAdd", (member) => enqueue("加入", async () => {
+client.on("guildMemberAdd", (member) => enqueueSheets("加入", async () => {
   await syncMember(member);
   await sortEmployees(await readEmployees());
 }));
-client.on("guildMemberUpdate", (_oldMember, newMember) => enqueue("ロール変更", async () => {
+client.on("guildMemberUpdate", (_oldMember, newMember) => enqueueSheets("ロール変更", async () => {
   await syncMember(newMember);
   await sortEmployees(await readEmployees());
 }));
-client.on("guildMemberRemove", (member) => enqueue("脱退", () => markRemoved(member)));
+client.on("guildMemberRemove", (member) => enqueueSheets("脱退", () => markRemoved(member)));
 
 const port = Number(process.env.PORT || 3000);
 http.createServer((_req, res) => {
