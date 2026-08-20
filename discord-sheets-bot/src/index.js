@@ -509,7 +509,8 @@ const interviewSettingsSheetName = "面接設定";
 const interviewQuestionsSheetName = "面接質問設定";
 const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
-const staffReportSheetName = "署員報告";
+const staffProfileSheetName = "署員個票";
+const staffProfileSheetId = 2090134610;
 const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1443`;
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
@@ -1581,7 +1582,7 @@ function rankOperationType(rankMap, previousRank, nextRank) {
 async function appendStaffReport(fields) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: `'${staffReportSheetName}'!A:K`,
+    range: `'${staffProfileSheetName}'!J:T`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values: [[
@@ -1604,7 +1605,7 @@ async function readStaffReportSummary(discordId) {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `'${staffReportSheetName}'!A2:K500`,
+      range: `'${staffProfileSheetName}'!J2:T1000`,
       valueRenderOption: "UNFORMATTED_VALUE",
     });
     return (response.data.values || [])
