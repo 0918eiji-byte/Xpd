@@ -5,6 +5,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   Client,
+  ChannelType,
   EmbedBuilder,
   GatewayIntentBits,
   MessageFlags,
@@ -511,7 +512,7 @@ const interviewManagementSheetName = "面接者管理";
 const onboardingSheetName = "採用手続き管理";
 const staffProfileSheetName = "署員個票";
 const staffProfileSheetId = 2090134610;
-const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1443`;
+const rankOperationConfigRange = `'${unifiedSettingsSheetName}'!A1439:B1444`;
 const onboardingHeaders = [
   "応募ID", "面接ID", "募集回", "受験者名", "Discordユーザー名", "DiscordユーザーID",
   "面接合格日時", "手続き完了", "対応署員", "完了日時", "採用状態", "ロール処理結果",
@@ -1559,12 +1560,71 @@ async function readRankOperationSettings() {
   });
   const values = response.data.values || [];
   const map = new Map(values.map((row) => [String(row[0] || "").trim(), normalizedId(row[1])]));
+  const reportChannelId = map.get("ランク報告チャンネルID") || "";
   const managementRoleId = map.get("ランク操作管理ロールID") || "";
   const promotionThreadId = map.get("昇格報告スレッドID") || "";
   const demotionThreadId = map.get("降格報告スレッドID") || "";
   const warningThreadId = map.get("警告報告スレッドID") || "";
   const reportThreadId = map.get("一般報告スレッドID") || "";
-  return { managementRoleId, promotionThreadId, demotionThreadId, warningThreadId, reportThreadId };
+  return { reportChannelId, managementRoleId, promotionThreadId, demotionThreadId, warningThreadId, reportThreadId };
+}
+
+async function ensureRankReportDestinations(guild) {
+  const settings = await readRankOperationSettings();
+  let channel = null;
+  if (/^\d{17,20}$/.test(settings.reportChannelId || "")) {
+    channel = await guild.channels.fetch(settings.reportChannelId).catch(() => null);
+  }
+  if (!channel) {
+    channel = guild.channels.cache.find((item) => item.type === ChannelType.GuildText && item.name === "ランク報告") || null;
+  }
+  if (!channel) {
+    channel = await guild.channels.create({
+      name: "ランク報告",
+      type: ChannelType.GuildText,
+      reason: "ランク操作報告チャンネルを自動作成",
+    });
+  }
+  if (channel.type !== ChannelType.GuildText || !channel.threads) {
+    throw new Error("ランク報告チャンネルは通常のテキストチャンネルにしてください");
+  }
+  await channel.threads.fetchActive().catch(() => null);
+  const threadNames = [
+    ["昇格", "promotionThreadId"],
+    ["降格", "demotionThreadId"],
+    ["警告", "warningThreadId"],
+    ["報告", "reportThreadId"],
+  ];
+  const threadIds = {};
+  for (const [name, key] of threadNames) {
+    let thread = channel.threads.cache.find((item) => item.name === name);
+    if (!thread) {
+      thread = await channel.threads.create({
+        name,
+        autoArchiveDuration: 1440,
+        reason: `ランク報告の${name}スレッドを自動作成`,
+      });
+    }
+    threadIds[key] = thread.id;
+  }
+  const destinations = [
+    ["B1440", channel.id],
+    ["B1441", threadIds.promotionThreadId],
+    ["B1442", threadIds.demotionThreadId],
+    ["B1443", threadIds.warningThreadId],
+    ["B1444", threadIds.reportThreadId],
+  ];
+  const current = [settings.reportChannelId, settings.promotionThreadId, settings.demotionThreadId, settings.warningThreadId, settings.reportThreadId];
+  const updates = destinations.filter(([, id], index) => current[index] !== id)
+    .map(([cell, id]) => ({ range: `'${unifiedSettingsSheetName}'!${cell}`, values: [[discordIdCell(id)]] }));
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+  }
+  console.log(`ランク報告先を確認: #${channel.name} / ${threadNames.map(([name]) => name).join("・")}`);
+  return { channel, threadIds };
 }
 
 function rankOperationPermission(interaction, settings) {
@@ -3642,6 +3702,12 @@ client.once("clientReady", async () => {
     await auditUnifiedSettings(true);
   } catch (error) {
     console.error("統合設定の起動時監査失敗:", error.message);
+  }
+  try {
+    const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
+    await ensureRankReportDestinations(guild);
+  } catch (error) {
+    console.error("ランク報告先の自動準備失敗:", error.message);
   }
   try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
