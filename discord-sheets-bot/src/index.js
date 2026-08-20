@@ -566,14 +566,6 @@ async function ensureRankAndEmployeeValidation() {
   const enabledRankNames = rankRows
     .filter((row) => isEnabledSetting(row?.[5]) && String(row?.[1] || "").trim())
     .map((row) => String(row[1]).trim());
-  const employeeIdColumn = employeeSheet.headerMap.get("社員ID");
-  const employeeNameColumn = employeeSheet.headerMap.get("表示名");
-  const profileOptions = employeeSheet.rows
-    .filter((row) => String(row?.[employeeIdColumn] || "").trim() && String(row?.[employeeNameColumn] || "").trim())
-    .slice(0, 500)
-    .map((row) => ({
-      userEnteredValue: `${String(row[employeeIdColumn]).trim()}｜${String(row[employeeNameColumn]).trim()}`.slice(0, 90),
-    }));
   const rankColumn = employeeSheet.headerMap.get(rankSelectionHeader);
   const triggerColumn = employeeSheet.headerMap.get(actionTriggerHeader);
   const requests = [
@@ -604,14 +596,6 @@ async function ensureRankAndEmployeeValidation() {
       setDataValidation: {
         range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: triggerColumn, endColumnIndex: triggerColumn + 1 },
         rule: { condition: { type: "BOOLEAN" }, strict: true, showCustomUi: true },
-      },
-    });
-  }
-  if (profileOptions.length) {
-    requests.push({
-      setDataValidation: {
-        range: { sheetId: staffProfileSheetId, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 4 },
-        rule: { condition: { type: "ONE_OF_LIST", values: profileOptions }, strict: false, showCustomUi: true },
       },
     });
   }
@@ -1748,7 +1732,7 @@ function commandBoardEmbed(kind) {
       ? [{ name: "面接（/mensetu）", value: "書類合格者を選択して面接を開始します。質問に回答後、投票へ進みます。", inline: false }]
       : [
         { name: "ランク操作（/rank）", value: "署員を選び、昇格・降格・警告・報告を実行します。備考は必須です。", inline: false },
-        { name: "署員個票（/syoin）", value: "自分の署員情報・ランク変更履歴・報告欄を表示します。", inline: false },
+        { name: "署員個票（/syoin）", value: "署員一覧から対象者を選択し、プロフィール・ランク変更履歴・報告欄を表示します。", inline: false },
       ]))
     .setFooter({ text: interview ? "詳細検索は /mensetu を使用してください" : "検索は /rank・/syoin を使用してください" })
     .setTimestamp();
@@ -3634,6 +3618,43 @@ async function handleStaffProfileCommand(interaction) {
   await interaction.editReply({ embeds: [staffProfileEmbed(profile, member)] });
 }
 
+async function handleStaffProfileBoardCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!canViewStaffProfile(interaction)) {
+    await interaction.editReply("署員個票はPolice Officerロールを持つ署員または管理者のみ検索できます。");
+    return;
+  }
+  const candidates = await rankEmployeeCandidates("");
+  if (!candidates.length) {
+    await interaction.editReply("現在、選択できる在籍署員がいません。");
+    return;
+  }
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("command:syoin:target")
+    .setPlaceholder("個票を表示する署員を選択")
+    .addOptions(candidates.slice(0, 25).map((employee) => new StringSelectMenuOptionBuilder()
+      .setLabel(truncateDiscord(employee.name, 100))
+      .setDescription(`${employee.rank} / ${employee.id}`.slice(0, 100))
+      .setValue(employee.id)));
+  await interaction.editReply({
+    content: candidates.length > 25 ? "先頭25名を表示しています。詳細検索は /syoin を使用してください。" : "個票を表示する署員を選択してください。",
+    components: [new ActionRowBuilder().addComponents(select)],
+  });
+}
+
+async function handleStaffProfileBoardTarget(interaction) {
+  if (!canViewStaffProfile(interaction)) throw new Error("署員個票を閲覧する権限がありません。");
+  const discordId = interaction.values[0];
+  const [profile, guild] = await Promise.all([
+    staffProfile(discordId),
+    client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
+  ]);
+  if (!profile) throw new Error(`ID \`${discordId}\` は署員一覧に見つかりません。Discord IDが違います。`);
+  const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
+  if (!member) throw new Error(`Discord ID \`${discordId}\` を確認できません。Discord IDが違います。`);
+  await interaction.editReply({ content: "", embeds: [staffProfileEmbed(profile, member)], components: [] });
+}
+
 async function enqueueInterviewInteraction(label, interaction, work) {
   await enqueueDiscordOperation(label, async () => {
     try {
@@ -3681,7 +3702,7 @@ client.on("interactionCreate", async (interaction) => {
       try {
         if (action === "mensetu") await handleInterviewCommand(interaction);
         else if (action === "rank") await handleRankCommand(interaction);
-        else if (action === "syoin") await handleStaffProfileCommand(interaction);
+        else if (action === "syoin") await handleStaffProfileBoardCommand(interaction);
         else await interaction.reply({ content: "この操作ボードのボタンは無効です。管理者に確認してください。", flags: MessageFlags.Ephemeral });
       } finally {
         commandBoardLocks.delete(lockKey);
@@ -3698,6 +3719,15 @@ client.on("interactionCreate", async (interaction) => {
     }
     if (interaction.isChatInputCommand() && interaction.commandName === "mensetu") {
       await handleInterviewCommand(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === "command:syoin:target") {
+      if (!commandBoardChannels.get("syoin") || interaction.channelId !== commandBoardChannels.get("syoin")) {
+        await interaction.reply({ content: "この個票選択はランク管理ボードの専用チャンネルでのみ使用できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.deferUpdate();
+      await handleStaffProfileBoardTarget(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId === "rank:target") {
