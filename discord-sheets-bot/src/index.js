@@ -1611,7 +1611,7 @@ async function readStaffReportSummary(discordId) {
       .filter((row) => String(row[1] || "").replace(/^'/, "").trim() === discordId)
       .slice(-5)
       .reverse()
-      .map((row) => `[${row[0] || "日時不明"}] ${row[8] || "ランク変更"}: ${row[5] || "？？？？"} → ${row[6] || "？？？？"} / ${row[7] || "理由なし"}`)
+      .map((row) => `[${row[0] || "日時不明"}] ${row[8] || "ランク変更"}: ${row[5] || "？？？？"} → ${row[6] || "？？？？"} / ${row[7] || "備考なし"}`)
       .join("\n");
   } catch (error) {
     if (error.code === 400 || /Unable to parse range|not found/i.test(error.message || "")) return "";
@@ -3204,11 +3204,11 @@ async function handleRankActionSelect(interaction, discordId) {
   const action = interaction.values[0];
   if (["警告", "報告"].includes(action)) {
     await interaction.update({
-      content: `操作: **${action}**\nランクは変更しません。理由を入力してください。`,
+      content: `操作: **${action}**\nランクは変更しません。備考を入力してください。`,
       components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(action)}:none`)
-          .setLabel("理由を入力して実行")
+          .setLabel("備考を入力して実行")
           .setStyle(ButtonStyle.Primary),
       )],
     });
@@ -3243,11 +3243,11 @@ async function handleRankNextSelect(interaction, discordId, encodedAction) {
   const nextRank = interaction.values[0];
   const action = decodeURIComponent(encodedAction);
   await interaction.update({
-    content: `操作: **${action}**\n変更後ランク: **${truncateDiscord(nextRank, 100)}**\n理由を入力して実行してください。理由は必須です。`,
+    content: `操作: **${action}**\n変更後ランク: **${truncateDiscord(nextRank, 100)}**\n備考を入力して実行してください。備考は必須です。`,
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`rank:reason:${discordId}:${encodeURIComponent(action)}:${encodeURIComponent(nextRank)}`)
-        .setLabel("理由を入力して実行")
+        .setLabel("備考を入力して実行")
         .setStyle(ButtonStyle.Primary),
     )],
   });
@@ -3257,14 +3257,14 @@ async function handleRankReasonButton(interaction) {
   const [, , discordId, encodedAction, encodedRank] = interaction.customId.split(":");
   const modal = new ModalBuilder()
     .setCustomId(`rank:submit:${discordId}:${encodedAction}:${encodedRank}`)
-    .setTitle("操作理由");
+    .setTitle("操作備考");
   const reason = new TextInputBuilder()
     .setCustomId("reason")
-    .setLabel("理由（必須）")
+    .setLabel("備考（必須）")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(500)
-    .setPlaceholder("昇格・降格・警告・報告の理由を入力してください");
+    .setPlaceholder("昇格・降格・警告・報告の備考を入力してください");
   modal.addComponents(new ActionRowBuilder().addComponents(reason));
   await interaction.showModal(modal);
 }
@@ -3277,7 +3277,7 @@ async function handleRankSubmit(interaction) {
   const action = decodeURIComponent(encodedAction);
   const nextRank = decodeURIComponent(encodedRank);
   const reason = String(interaction.fields.getTextInputValue("reason") || "").trim();
-  if (!reason) throw new Error("変更理由は必須です。");
+  if (!reason) throw new Error("備考は必須です。");
   const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
   const [rankMap, employeeSheet] = await Promise.all([readRankMap(), readEmployees()]);
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
@@ -3287,7 +3287,7 @@ async function handleRankSubmit(interaction) {
   const currentRank = assessMember(member, rankMap).rankName || "？？？？";
   const isRankMovement = ["昇格", "降格"].includes(action);
   if (isRankMovement && !nextRank) throw new Error("変更後ランクを選択してください。");
-  const type = isRankMovement ? action : action;
+  const type = action;
   const threadId = action === "昇格"
     ? settings.promotionThreadId
     : action === "降格"
@@ -3307,11 +3307,11 @@ async function handleRankSubmit(interaction) {
       "適用ランク": nextRank,
       "Discordロール": rankByName(rankMap, nextRank)?.roleName || nextRank,
     } : {}),
-    "操作結果": `完了: ${type}${isRankMovement ? ` ${result.transition}` : "（ランク変更なし）"} / ${reason}`,
+    "操作結果": `完了: ${type}${isRankMovement ? ` ${result.transition}` : "（ランク変更なし）"} / 備考: ${reason}`,
     "操作日時": new Date().toISOString(),
   });
   const report = await thread.send({
-    content: `【${type}報告】\n対象: <@${discordId}>\n変更: ${isRankMovement ? `${currentRank} → ${nextRank}` : "なし"}\n理由: ${reason}\n実行者: <@${interaction.user.id}>`,
+    content: `【${type}報告】\n対象: <@${discordId}>\n変更: ${isRankMovement ? `${currentRank} → ${nextRank}` : "なし"}\n備考: ${reason}\n実行者: <@${interaction.user.id}>`,
     allowedMentions: { users: [discordId, interaction.user.id] },
   });
   const threadUrl = `https://discord.com/channels/${guildId}/${thread.id}/${report.id}`;
