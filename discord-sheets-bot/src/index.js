@@ -328,6 +328,7 @@ let discordOperationQueue = Promise.resolve();
 const lastSynchronizedRanks = new Map();
 let sheetsQuotaBackoffUntil = 0;
 let sheetsQuotaBackoffLevel = 0;
+const announcementRetryButtonsInstalled = new Set();
 
 function isSheetsQuotaError(error) {
   const status = Number(error?.code || error?.response?.status || error?.response?.data?.error?.code || 0);
@@ -2071,7 +2072,7 @@ async function fetchApplicationPoll(application, setting) {
   return state;
 }
 
-async function sendApplicationPass(setting, application) {
+async function sendApplicationPass(setting, application, { resend = false } = {}) {
   const channel = await textChannel(setting.passChannelId, "合格発表");
   const userId = await resolveApplicantDiscordUserId(application.discordId);
   const content = [setting.passMessage || "合格が決定しました。", userId ? `<@${userId}>` : ""]
@@ -2080,7 +2081,9 @@ async function sendApplicationPass(setting, application) {
   const message = await channel.send({
     content,
     allowedMentions: { users: userId ? [userId] : [] },
-    nonce: discordNonce("docpass", application.id),
+    // A resend must get a fresh nonce; reusing the original nonce can be
+    // deduplicated by Discord and appear as if nothing was sent.
+    nonce: discordNonce("docpass", resend ? `${application.id}:${Date.now()}` : application.id),
     enforceNonce: true,
   });
   return { messageId: message.id, applicantMatched: Boolean(userId) };
@@ -2403,7 +2406,9 @@ async function processRecruitmentApplications() {
             await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
             application.passAnnouncementMessageId = announcement.messageId;
             application.processResult = result;
-            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
+            // Keep the per-applicant resend button available after success.
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch(() => {});
+            announcementRetryButtonsInstalled.add(`doc:${application.id}`);
             passAnnouncementCount += 1;
           } catch (error) {
             await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch((buttonError) => {
@@ -2426,7 +2431,8 @@ async function processRecruitmentApplications() {
             const result = `${application.processResult || "投票結果を確定"} / 書類非表示へ更新${applicantMatched ? "" : "（本人メンション未解決）"}`;
             await writeApplicationAnnouncementState(application.rowNumber, application.passAnnouncementMessageId, result);
             application.processResult = result;
-            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch(() => {});
+            announcementRetryButtonsInstalled.add(`doc:${application.id}`);
           } catch (error) {
             await sheets.spreadsheets.values.update({
               spreadsheetId,
@@ -2434,6 +2440,17 @@ async function processRecruitmentApplications() {
               valueInputOption: "RAW",
               requestBody: { values: [[`合格発表更新エラー: ${error.message}`]] },
             });
+          }
+        } else if (application.pollStatus === "FINAL"
+          && application.verdict === "合格"
+          && setting.passChannelId
+          && application.passAnnouncementMessageId
+          && !announcementRetryButtonsInstalled.has(`doc:${application.id}`)) {
+          try {
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true);
+            announcementRetryButtonsInstalled.add(`doc:${application.id}`);
+          } catch (error) {
+            console.warn(`書類合格発表の再送ボタン更新失敗 (${application.id}):`, error.message);
           }
         }
       }
@@ -3104,7 +3121,7 @@ async function handleInterviewCancelButton(interaction, interviewId) {
   await interaction.editReply({ content: "面接をキャンセルしました。応募者は再び候補一覧へ戻ります。", embeds: [], components: [] });
 }
 
-async function sendInterviewPass(setting, record) {
+async function sendInterviewPass(setting, record, { resend = false } = {}) {
   if (!setting.passChannelId) throw new Error("面接合格発表チャンネルIDが未設定です");
   const channel = await textChannel(setting.passChannelId, "面接合格発表");
   const userId = record.applicantDiscordId || await resolveApplicantDiscordUserId(record.applicantDiscordName);
@@ -3112,7 +3129,7 @@ async function sendInterviewPass(setting, record) {
   const message = await channel.send({
     content,
     allowedMentions: { users: userId ? [userId] : [] },
-    nonce: discordNonce("ivpass", record.id),
+    nonce: discordNonce("ivpass", resend ? `${record.id}:${Date.now()}` : record.id),
     enforceNonce: true,
   });
   return { messageId: message.id, applicantMatched: Boolean(userId) };
@@ -3141,11 +3158,6 @@ async function handleDocumentAnnouncementResend(interaction, applicationId) {
     await interaction.editReply("この応募は現在、再送信できる合格状態ではありません。シートの投票結果を確認してください。");
     return;
   }
-  if (application.passAnnouncementMessageId) {
-    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
-    await interaction.editReply("この合格発表はすでに送信済みです。重複送信は行いません。");
-    return;
-  }
   const settings = await readRecruitmentSettings();
   const setting = settings.find((item) => item.roundName === application.roundName);
   if (!setting?.passChannelId) {
@@ -3153,11 +3165,11 @@ async function handleDocumentAnnouncementResend(interaction, applicationId) {
     return;
   }
   try {
-    const announcement = await sendApplicationPass(setting, application);
-    const result = `${application.processResult || "投票結果を確定"} / 合格発表済（書類非表示）${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+    const announcement = await sendApplicationPass(setting, application, { resend: true });
+    const result = `${application.processResult || "投票結果を確定"} / 合格発表再送済（書類非表示）${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
     await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
-    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
-    await interaction.editReply(`合格発表を再送信しました。${announcement.applicantMatched ? "本人メンション付きです。" : "本人メンションは解決できませんでした。"}`);
+    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch(() => {});
+    await interaction.editReply(`書類合格発表を再送信しました。${announcement.applicantMatched ? "本人メンション付きです。" : "本人メンションは解決できませんでした。"}`);
   } catch (error) {
     await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch(() => {});
     await interaction.editReply(`再送信に失敗しました: ${error.message}\n設定とBot権限を確認して、もう一度押してください。`);
@@ -3180,21 +3192,16 @@ async function handleInterviewAnnouncementResend(interaction, interviewId) {
     await interaction.editReply("この面接は現在、再送信できる合格状態ではありません。投票結果を確認してください。");
     return;
   }
-  if (record.passAnnouncementMessageId) {
-    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
-    await interaction.editReply("この面接合格発表はすでに送信済みです。重複送信は行いません。");
-    return;
-  }
   const setting = settings.find((item) => item.roundName === record.roundName);
   if (!setting?.passChannelId) {
     await interaction.editReply("面接合格発表チャンネルが未設定です。設定シートを確認してください。");
     return;
   }
   try {
-    const announcement = await sendInterviewPass(setting, record);
-    const result = `${record.processResult || "面接結果を確定"} / 面接合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+    const announcement = await sendInterviewPass(setting, record, { resend: true });
+    const result = `${record.processResult || "面接結果を確定"} / 面接合格発表再送済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
     await updateInterviewRecord(record, { X: result, Y: discordIdCell(announcement.messageId) });
-    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
+    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch(() => {});
     await interaction.editReply(`面接合格発表を再送信しました。${announcement.applicantMatched ? "本人メンション付きです。" : "本人メンションは解決できませんでした。"}`);
   } catch (error) {
     await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch(() => {});
@@ -3476,13 +3483,25 @@ async function processInterviewPolls() {
           const result = `${record.processResult || "面接結果を確定"} / 面接合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
           await updateInterviewRecord(record, { X: result, Y: discordIdCell(announcement.messageId) });
           record.passAnnouncementMessageId = announcement.messageId;
-          await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
+          // Keep the per-applicant resend button available after success.
+          await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch(() => {});
           announcedCount += 1;
         } catch (error) {
           await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch((buttonError) => {
             console.warn(`面接合格発表の再送信ボタン設置失敗 (${record.id}):`, buttonError.message);
           });
           await updateInterviewRecord(record, { X: `面接合格発表エラー: ${error.message}` });
+        }
+      } else if (record.pollStatus === "FINAL"
+        && record.verdict === "合格"
+        && setting.passChannelId
+        && record.passAnnouncementMessageId
+        && !announcementRetryButtonsInstalled.has(`iv:${record.id}`)) {
+        try {
+          await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true);
+          announcementRetryButtonsInstalled.add(`iv:${record.id}`);
+        } catch (error) {
+          console.warn(`面接合格発表の再送ボタン更新失敗 (${record.id}):`, error.message);
         }
       }
     }
