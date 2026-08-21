@@ -79,6 +79,10 @@ let lastSettingsViewCheckAt = 0;
 let unifiedSettingsHealthy = false;
 let lastUnifiedAuditAt = 0;
 let unifiedSettingsSnapshot = null;
+// Status cells are informational only.  Do not spend Sheets write quota on a
+// heartbeat during every audit; enable explicitly when repairing the UI.
+let lastUnifiedStatusKey = "";
+let lastUnifiedStatusWriteAt = 0;
 
 const unifiedSettingsCategoryOptions = [
   "すべて", "ランク", "ボーナス回", "書類選考", "面接", "面接質問", "連携", "ランク報告", "操作ボード",
@@ -243,16 +247,23 @@ async function auditUnifiedSettings(force = false) {
         auditedAt: now,
       };
     }
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: [
-          { range: `'${unifiedSettingsSheetName}'!E3`, values: [[uniqueErrors.length ? `要確認: ${uniqueErrors.slice(0, 3).join(" / ")}` : "正常"]] },
-          { range: `'${unifiedSettingsSheetName}'!H3`, values: [[sheetDateTime(new Date())]] },
-        ],
-      },
-    });
+    const statusKey = uniqueErrors.length ? `要確認: ${uniqueErrors.slice(0, 3).join(" / ")}` : "正常";
+    const shouldWriteStatus = process.env.SETTINGS_HEARTBEAT_WRITE === "1"
+      && (statusKey !== lastUnifiedStatusKey || now - lastUnifiedStatusWriteAt >= 900000);
+    if (shouldWriteStatus) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data: [
+            { range: `'${unifiedSettingsSheetName}'!E3`, values: [[statusKey]] },
+            { range: `'${unifiedSettingsSheetName}'!H3`, values: [[sheetDateTime(new Date())]] },
+          ],
+        },
+      });
+      lastUnifiedStatusKey = statusKey;
+      lastUnifiedStatusWriteAt = now;
+    }
     return unifiedSettingsHealthy;
   } catch (error) {
     if (isSheetsQuotaError(error)) lastUnifiedAuditAt = 0;
@@ -4128,20 +4139,26 @@ async function markRemoved(member) {
 
 client.once("clientReady", async () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
-  try {
-    await ensureUnifiedSettingsCategoryValidation();
-  } catch (error) {
-    console.error("設定カテゴリの入力規則更新失敗:", error.message);
+  // These are repair operations, not runtime prerequisites.  Running them on
+  // every Railway restart can exhaust the Sheets write quota before form sync.
+  if (process.env.REPAIR_SETTINGS_UI === "1") {
+    try {
+      await ensureUnifiedSettingsCategoryValidation();
+    } catch (error) {
+      console.error("設定カテゴリの入力規則更新失敗:", error.message);
+    }
   }
   try {
     await auditUnifiedSettings(true);
   } catch (error) {
     console.error("統合設定の起動時監査失敗:", error.message);
   }
-  try {
-    await ensureRankAndEmployeeValidation();
-  } catch (error) {
-    console.error("ランク設定・署員一覧の入力規則更新失敗:", error.message);
+  if (process.env.REPAIR_SETTINGS_UI === "1") {
+    try {
+      await ensureRankAndEmployeeValidation();
+    } catch (error) {
+      console.error("ランク設定・署員一覧の入力規則更新失敗:", error.message);
+    }
   }
   try {
     const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId);
@@ -4168,11 +4185,13 @@ client.once("clientReady", async () => {
         console.log(`Google Sheets読込待機中: 残り約${sheetsBackoffRemainingSeconds()}秒`);
         return;
       }
+      // Form import is the highest priority.  A quota failure in an unrelated
+      // maintenance job must not prevent the recruitment importer from running.
       const jobs = [
+        ["書類選考", processRecruitmentApplications],
         ["統合設定監査", auditUnifiedSettings],
         ["署員一覧操作", processSheetActions],
         ["ボーナス配布", processBonusDistribution],
-        ["書類選考", processRecruitmentApplications],
         ["面接", processInterviewPolls],
         ["採用手続き", processOnboarding],
         ["退職手続き", processTerminations],
@@ -4186,7 +4205,9 @@ client.once("clientReady", async () => {
           console.error(`[${label}]`, message);
           if (registerSheetsQuotaError(error)) {
             completedWithoutQuotaError = false;
-            break;
+            // Keep independent jobs isolated.  The next cycle is gated by the
+            // shared backoff, but this cycle must not starve later recovery.
+            continue;
           }
         }
       }
@@ -4204,11 +4225,11 @@ client.once("clientReady", async () => {
     }
     setTimeout(pollSettingsView, 10000);
   };
-  enqueueSheets("起動時全件同期", fullSync)
-    .finally(() => {
-      setTimeout(pollSheetActions, initialPollDelay);
-      setTimeout(pollSettingsView, 10000);
-    });
+  // Start form/application polling independently of the expensive member
+  // backfill.  A large fullSync must never delay the first recruitment import.
+  setTimeout(pollSheetActions, initialPollDelay);
+  setTimeout(pollSettingsView, 10000);
+  setTimeout(() => enqueueSheets("起動時全件同期", fullSync), 120000);
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
   console.log(`起動後の初回シート確認: ${initialPollDelay}ms後`);
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
