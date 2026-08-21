@@ -79,6 +79,8 @@ let lastSettingsViewCheckAt = 0;
 let unifiedSettingsHealthy = false;
 let lastUnifiedAuditAt = 0;
 let unifiedSettingsSnapshot = null;
+const recruitmentStatusCache = new Map();
+const interviewStatusCache = new Map();
 // Status cells are informational only.  Do not spend Sheets write quota on a
 // heartbeat during every audit; enable explicitly when repairing the UI.
 let lastUnifiedStatusKey = "";
@@ -1070,13 +1072,30 @@ async function consolidateEmployeeDuplicates() {
 }
 
 async function writeActionResult(employeeSheet, rowNumber, fields) {
+  const row = employeeSheet.rows[rowNumber - 3] || [];
+  const changedFields = Object.fromEntries(Object.entries(fields).filter(([header, value]) => {
+    const column = employeeSheet.headerMap.get(header);
+    if (column === undefined) return false;
+    const previous = row[column];
+    // Action/status cells are strings or booleans. Avoid a Sheets write when
+    // the value already matches; this function runs for every employee every
+    // polling cycle.
+    if (typeof value === "boolean") return isChecked(previous) !== value;
+    return String(previous ?? "").trim() !== String(value ?? "").trim();
+  }));
+  if (!Object.keys(changedFields).length) return false;
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId,
     requestBody: {
       valueInputOption: "USER_ENTERED",
-      data: rowUpdate(employeeSheet, rowNumber, fields),
+      data: rowUpdate(employeeSheet, rowNumber, changedFields),
     },
   });
+  for (const [header, value] of Object.entries(changedFields)) {
+    const column = employeeSheet.headerMap.get(header);
+    if (column !== undefined) row[column] = value;
+  }
+  return true;
 }
 
 async function processSheetActions() {
@@ -1510,6 +1529,10 @@ async function readRecruitmentSettings() {
 }
 
 async function writeRecruitmentStatus(setting, status) {
+  const key = `${setting.source || "legacy"}:${setting.roundName}`;
+  const now = Date.now();
+  const previous = recruitmentStatusCache.get(key);
+  if (previous && previous.status === status && now - previous.at < 900000) return;
   const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : recruitmentSettingsSheetName;
   await sheets.spreadsheets.values.update({
     spreadsheetId,
@@ -1517,6 +1540,7 @@ async function writeRecruitmentStatus(setting, status) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date()), false]] },
   });
+  recruitmentStatusCache.set(key, { status, at: now });
 }
 
 async function applyApplicationRoundFilter(roundName) {
@@ -2538,6 +2562,10 @@ function selectInterviewPollSetting(settings, record, interaction = null) {
 }
 
 async function writeInterviewStatus(setting, status) {
+  const key = `${setting.source || "legacy"}:${setting.roundName}`;
+  const now = Date.now();
+  const previous = interviewStatusCache.get(key);
+  if (previous && previous.status === status && now - previous.at < 900000) return;
   const sheetName = setting.source === "unified" ? unifiedSettingsSheetName : interviewSettingsSheetName;
   await sheets.spreadsheets.values.update({
     spreadsheetId,
@@ -2545,6 +2573,7 @@ async function writeInterviewStatus(setting, status) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [[status, sheetDateTime(new Date())]] },
   });
+  interviewStatusCache.set(key, { status, at: now });
 }
 
 async function readInterviewQuestions(questionSet) {
@@ -4258,10 +4287,13 @@ client.once("clientReady", async () => {
     setTimeout(pollSettingsView, 10000);
   };
   // Start form/application polling independently of the expensive member
-  // backfill.  A large fullSync must never delay the first recruitment import.
+  // backfill.  A large fullSync must never consume the Sheets write quota in
+  // normal operation; run it only when explicitly requested during maintenance.
   setTimeout(pollSheetActions, initialPollDelay);
   setTimeout(pollSettingsView, 10000);
-  setTimeout(() => enqueueSheets("起動時全件同期", fullSync), 120000);
+  if (process.env.FULL_SYNC_ON_START === "1") {
+    setTimeout(() => enqueueSheets("起動時全件同期", fullSync), 120000);
+  }
   console.log(`シート操作・応募・退職処理監視: ${actionPollInterval}ms間隔`);
   console.log(`起動後の初回シート確認: ${initialPollDelay}ms後`);
   console.log(`応募フォーム確認: ${recruitmentPollIntervalMs}ms間隔`);
