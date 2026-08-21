@@ -2350,9 +2350,6 @@ async function processRecruitmentApplications() {
             Object.assign(application, state);
             pollCreatedCount += 1;
           } catch (error) {
-            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch((buttonError) => {
-              console.warn(`書類合格発表の再送信ボタン設置失敗 (${application.id}):`, buttonError.message);
-            });
             await sheets.spreadsheets.values.update({
               spreadsheetId,
               range: `'${applicationSheetName}'!X${application.rowNumber}`,
