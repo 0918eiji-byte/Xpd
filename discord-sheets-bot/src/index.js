@@ -2075,6 +2075,24 @@ async function sendApplicationPass(setting, application) {
   return { messageId: message.id, applicantMatched: Boolean(userId) };
 }
 
+function announcementRetryComponents(kind, id) {
+  const prefix = kind === "interview" ? "iv" : "doc";
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`resend:${prefix}:${id}`)
+      .setLabel("合格発表を再送信")
+      .setStyle(ButtonStyle.Danger),
+  )];
+}
+
+async function setAnnouncementRetryButton(channelId, messageId, kind, id, enabled) {
+  if (!/^\d{17,20}$/.test(String(channelId || "")) || !/^\d{17,20}$/.test(String(messageId || ""))) return false;
+  const channel = await textChannel(channelId, kind === "interview" ? "面接投票" : "投票");
+  const message = await channel.messages.fetch({ message: messageId, force: true });
+  await message.edit({ components: enabled ? announcementRetryComponents(kind, id) : [] });
+  return true;
+}
+
 async function sanitizeApplicationPass(setting, application) {
   const channel = await textChannel(setting.passChannelId, "合格発表");
   if (!channel.messages || typeof channel.messages.fetch !== "function") return false;
@@ -2332,6 +2350,9 @@ async function processRecruitmentApplications() {
             Object.assign(application, state);
             pollCreatedCount += 1;
           } catch (error) {
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch((buttonError) => {
+              console.warn(`書類合格発表の再送信ボタン設置失敗 (${application.id}):`, buttonError.message);
+            });
             await sheets.spreadsheets.values.update({
               spreadsheetId,
               range: `'${applicationSheetName}'!X${application.rowNumber}`,
@@ -2374,8 +2395,12 @@ async function processRecruitmentApplications() {
             await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
             application.passAnnouncementMessageId = announcement.messageId;
             application.processResult = result;
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
             passAnnouncementCount += 1;
           } catch (error) {
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch((buttonError) => {
+              console.warn(`書類合格発表の再送信ボタン設置失敗 (${application.id}):`, buttonError.message);
+            });
             await sheets.spreadsheets.values.update({
               spreadsheetId,
               range: `'${applicationSheetName}'!X${application.rowNumber}`,
@@ -2393,6 +2418,7 @@ async function processRecruitmentApplications() {
             const result = `${application.processResult || "投票結果を確定"} / 書類非表示へ更新${applicantMatched ? "" : "（本人メンション未解決）"}`;
             await writeApplicationAnnouncementState(application.rowNumber, application.passAnnouncementMessageId, result);
             application.processResult = result;
+            await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
           } catch (error) {
             await sheets.spreadsheets.values.update({
               spreadsheetId,
@@ -2646,7 +2672,6 @@ async function eligibleInterviewApplications(setting, search = "") {
     application.roundName === setting.roundName
     && application.pollStatus === "FINAL"
     && application.verdict === "合格"
-    && application.passAnnouncementMessageId
     && application.documentRoleStatus.startsWith("書類合格ロール付与済")
     && (!needle || [application.id, application.name, application.discordId]
       .some((value) => String(value || "").toLowerCase().includes(needle)))
@@ -3085,6 +3110,90 @@ async function sendInterviewPass(setting, record) {
   return { messageId: message.id, applicantMatched: Boolean(userId) };
 }
 
+async function canResendAnnouncement(interaction) {
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    || interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) return true;
+  const settings = await readRankOperationSettings();
+  return Boolean(settings.managementRoleId && interaction.member?.roles?.cache?.has(settings.managementRoleId));
+}
+
+async function handleDocumentAnnouncementResend(interaction, applicationId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!await canResendAnnouncement(interaction)) {
+    await interaction.editReply("合格発表の再送信には管理権限が必要です。");
+    return;
+  }
+  const applications = await readStep1Applications();
+  const application = applications.find((item) => item.id === applicationId);
+  if (application && (interaction.channelId !== application.pollChannelId || interaction.message?.id !== application.pollMessageId)) {
+    await interaction.editReply("この再送信ボタンは現在の投票メッセージと一致しません。最新の投票画面を確認してください。");
+    return;
+  }
+  if (!application || application.pollStatus !== "FINAL" || application.verdict !== "合格") {
+    await interaction.editReply("この応募は現在、再送信できる合格状態ではありません。シートの投票結果を確認してください。");
+    return;
+  }
+  if (application.passAnnouncementMessageId) {
+    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
+    await interaction.editReply("この合格発表はすでに送信済みです。重複送信は行いません。");
+    return;
+  }
+  const settings = await readRecruitmentSettings();
+  const setting = settings.find((item) => item.roundName === application.roundName);
+  if (!setting?.passChannelId) {
+    await interaction.editReply("合格発表チャンネルが未設定です。設定シートを確認してください。");
+    return;
+  }
+  try {
+    const announcement = await sendApplicationPass(setting, application);
+    const result = `${application.processResult || "投票結果を確定"} / 合格発表済（書類非表示）${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+    await writeApplicationAnnouncementState(application.rowNumber, announcement.messageId, result);
+    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, false).catch(() => {});
+    await interaction.editReply(`合格発表を再送信しました。${announcement.applicantMatched ? "本人メンション付きです。" : "本人メンションは解決できませんでした。"}`);
+  } catch (error) {
+    await setAnnouncementRetryButton(application.pollChannelId, application.pollMessageId, "document", application.id, true).catch(() => {});
+    await interaction.editReply(`再送信に失敗しました: ${error.message}\n設定とBot権限を確認して、もう一度押してください。`);
+  }
+}
+
+async function handleInterviewAnnouncementResend(interaction, interviewId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!await canResendAnnouncement(interaction)) {
+    await interaction.editReply("合格発表の再送信には管理権限が必要です。");
+    return;
+  }
+  const [records, settings] = await Promise.all([readInterviewRecords(), readInterviewSettings()]);
+  const record = records.find((item) => item.id === interviewId);
+  if (record && (interaction.channelId !== record.pollChannelId || interaction.message?.id !== record.pollMessageId)) {
+    await interaction.editReply("この再送信ボタンは現在の投票メッセージと一致しません。最新の投票画面を確認してください。");
+    return;
+  }
+  if (!record || record.pollStatus !== "FINAL" || record.verdict !== "合格") {
+    await interaction.editReply("この面接は現在、再送信できる合格状態ではありません。投票結果を確認してください。");
+    return;
+  }
+  if (record.passAnnouncementMessageId) {
+    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
+    await interaction.editReply("この面接合格発表はすでに送信済みです。重複送信は行いません。");
+    return;
+  }
+  const setting = settings.find((item) => item.roundName === record.roundName);
+  if (!setting?.passChannelId) {
+    await interaction.editReply("面接合格発表チャンネルが未設定です。設定シートを確認してください。");
+    return;
+  }
+  try {
+    const announcement = await sendInterviewPass(setting, record);
+    const result = `${record.processResult || "面接結果を確定"} / 面接合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
+    await updateInterviewRecord(record, { X: result, Y: discordIdCell(announcement.messageId) });
+    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
+    await interaction.editReply(`面接合格発表を再送信しました。${announcement.applicantMatched ? "本人メンション付きです。" : "本人メンションは解決できませんでした。"}`);
+  } catch (error) {
+    await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch(() => {});
+    await interaction.editReply(`再送信に失敗しました: ${error.message}\n設定とBot権限を確認して、もう一度押してください。`);
+  }
+}
+
 async function readOnboardingRows() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
@@ -3359,8 +3468,12 @@ async function processInterviewPolls() {
           const result = `${record.processResult || "面接結果を確定"} / 面接合格発表済${announcement.applicantMatched ? "" : "（本人メンション未解決）"}`;
           await updateInterviewRecord(record, { X: result, Y: discordIdCell(announcement.messageId) });
           record.passAnnouncementMessageId = announcement.messageId;
+          await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, false).catch(() => {});
           announcedCount += 1;
         } catch (error) {
+          await setAnnouncementRetryButton(record.pollChannelId, record.pollMessageId, "interview", record.id, true).catch((buttonError) => {
+            console.warn(`面接合格発表の再送信ボタン設置失敗 (${record.id}):`, buttonError.message);
+          });
           await updateInterviewRecord(record, { X: `面接合格発表エラー: ${error.message}` });
         }
       }
@@ -3753,6 +3866,14 @@ client.on("interactionCreate", async (interaction) => {
       } finally {
         commandBoardLocks.delete(lockKey);
       }
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("resend:doc:")) {
+      await handleDocumentAnnouncementResend(interaction, interaction.customId.slice("resend:doc:".length));
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith("resend:iv:")) {
+      await handleInterviewAnnouncementResend(interaction, interaction.customId.slice("resend:iv:".length));
       return;
     }
     if (interaction.isChatInputCommand() && interaction.commandName === "syoin") {
