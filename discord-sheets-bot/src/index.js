@@ -1981,6 +1981,14 @@ function applicationEmbed(application, title, color) {
     .setTimestamp();
 }
 
+async function findRecentPoll(channel, matches) {
+  if (!channel?.messages || typeof channel.messages.fetch !== "function") return null;
+  const messages = await channel.messages.fetch({ limit: 100 });
+  return messages.find((message) => message.author?.id === client.user?.id
+    && message.poll
+    && matches(message)) || null;
+}
+
 async function textChannel(channelId, label) {
   if (!/^\d{17,20}$/.test(channelId)) throw new Error(`${label}チャンネルIDが未設定です`);
   const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
@@ -2054,6 +2062,9 @@ async function fetchPollVoteCounts(message) {
 
 async function createApplicationPoll(setting, application) {
   const channel = await textChannel(setting.pollChannelId, "投票");
+  const existing = await findRecentPoll(channel, (message) => message.embeds?.some((embed) =>
+    embed.fields?.some((field) => field.name === "応募ID" && field.value === application.id)));
+  if (existing) return pollStateFromMessage(existing);
   const subject = truncateDiscord(application.name || application.discordId || application.id, 220);
   const message = await channel.send({
     content: setting.pollMessage,
@@ -2068,6 +2079,10 @@ async function createApplicationPoll(setting, application) {
       duration: setting.pollDurationHours,
     },
     allowedMentions: { parse: [] },
+    // Stable per-application nonce protects against a restart between Discord
+    // send and the spreadsheet state write.
+    nonce: discordNonce("docpoll", application.id),
+    enforceNonce: true,
   });
   return pollStateFromMessage(message);
 }
@@ -3107,6 +3122,9 @@ function interviewPollEmbed(record) {
 
 async function createInterviewPoll(setting, record) {
   const channel = await textChannel(setting.pollChannelId, "面接投票");
+  const existing = await findRecentPoll(channel, (message) =>
+    message.embeds?.some((embed) => String(embed.description || "").includes(`応募ID: **${record.applicationId}**`)));
+  if (existing) return existing;
   const message = await channel.send({
     content: setting.pollMessage,
     embeds: [interviewPollEmbed(record)],
@@ -3120,6 +3138,8 @@ async function createInterviewPoll(setting, record) {
       duration: setting.pollDurationHours,
     },
     allowedMentions: { parse: [] },
+    nonce: discordNonce("ivpoll", record.id),
+    enforceNonce: true,
   });
   return message;
 }
