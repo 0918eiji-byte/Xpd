@@ -330,6 +330,7 @@ let discordOperationQueue = Promise.resolve();
 const lastSynchronizedRanks = new Map();
 let sheetsQuotaBackoffUntil = 0;
 let sheetsQuotaBackoffLevel = 0;
+let maintenanceQuotaBackoffUntil = 0;
 const announcementRetryButtonsInstalled = new Set();
 
 function isSheetsQuotaError(error) {
@@ -2497,6 +2498,9 @@ async function processRecruitmentApplications() {
       );
     } catch (error) {
       const message = error.response?.data?.error?.message || error.message || String(error);
+      // A quota error must not trigger a second status write, which would
+      // prolong the outage. The central scheduler will retry automatically.
+      if (isSheetsQuotaError(error)) throw error;
       await writeRecruitmentStatus(setting, `エラー: ${message}`);
       console.error(`応募フォーム連携失敗: ${setting.roundName}`, message);
     }
@@ -4259,6 +4263,7 @@ client.once("clientReady", async () => {
       ];
       let completedWithoutQuotaError = true;
       for (const [label, job] of jobs) {
+        if (label !== "書類選考" && Date.now() < maintenanceQuotaBackoffUntil) continue;
         try {
           await job();
         } catch (error) {
@@ -4266,8 +4271,13 @@ client.once("clientReady", async () => {
           console.error(`[${label}]`, message);
           if (registerSheetsQuotaError(error)) {
             completedWithoutQuotaError = false;
-            // Keep independent jobs isolated.  The next cycle is gated by the
-            // shared backoff, but this cycle must not starve later recovery.
+            if (label !== "書類選考") {
+              // Maintenance jobs can be write-heavy. Back them off locally so
+              // they cannot starve the form importer in the next cycle.
+              maintenanceQuotaBackoffUntil = Date.now() + 120000;
+              sheetsQuotaBackoffUntil = Math.min(sheetsQuotaBackoffUntil, Date.now());
+            }
+            // Keep independent jobs isolated; recruitment remains first.
             continue;
           }
         }
