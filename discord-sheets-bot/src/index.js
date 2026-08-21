@@ -80,6 +80,37 @@ let unifiedSettingsHealthy = false;
 let lastUnifiedAuditAt = 0;
 let unifiedSettingsSnapshot = null;
 
+const unifiedSettingsCategoryOptions = [
+  "すべて", "ランク", "ボーナス回", "書類選考", "面接", "面接質問", "連携", "ランク報告", "操作ボード",
+];
+
+async function ensureUnifiedSettingsCategoryValidation() {
+  if (unifiedSettingsSheetId === null) {
+    const metadata = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets.properties(sheetId,title)",
+    });
+    unifiedSettingsSheetId = metadata.data.sheets
+      ?.find((sheet) => sheet.properties?.title === unifiedSettingsSheetName)?.properties?.sheetId ?? null;
+  }
+  if (unifiedSettingsSheetId === null) throw new Error("設定シートが見つかりません");
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        setDataValidation: {
+          range: { sheetId: unifiedSettingsSheetId, startRowIndex: 2, endRowIndex: 3, startColumnIndex: 1, endColumnIndex: 2 },
+          rule: {
+            condition: { type: "ONE_OF_LIST", values: unifiedSettingsCategoryOptions.map((value) => ({ userEnteredValue: value })) },
+            strict: false,
+            showCustomUi: true,
+          },
+        },
+      }],
+    },
+  });
+}
+
 async function unifiedSettingsReady(force = false) {
   if (force) await auditUnifiedSettings(true);
   return Boolean(unifiedSettingsHealthy && unifiedSettingsSnapshot);
@@ -3979,6 +4010,11 @@ async function markRemoved(member) {
 
 client.once("clientReady", async () => {
   console.log(`Discord接続完了: ${client.user.tag}`);
+  try {
+    await ensureUnifiedSettingsCategoryValidation();
+  } catch (error) {
+    console.error("設定カテゴリの入力規則更新失敗:", error.message);
+  }
   try {
     await auditUnifiedSettings(true);
   } catch (error) {
