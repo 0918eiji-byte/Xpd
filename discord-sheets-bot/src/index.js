@@ -3635,6 +3635,9 @@ async function registerRankCommand(guild) {
   console.log("ランク操作コマンド登録完了: /rank");
 }
 
+const rankSelectionSessions = new Map();
+const RANK_PAGE_SIZE = 25;
+
 async function rankEmployeeCandidates(search = "") {
   const employeeSheet = await readEmployees();
   const idColumn = employeeSheet.headerMap.get("社員ID");
@@ -3649,20 +3652,44 @@ async function rankEmployeeCandidates(search = "") {
       employeeId: String(row[idColumn] || "").trim(),
     }))
     .filter((employee) => employee.id && employee.name && employee.rank !== "解雇者")
-    .filter((employee) => !needle || [employee.id, employee.employeeId, employee.name].some((value) => value.toLocaleLowerCase().includes(needle)))
-    .slice(0, 25);
+    .filter((employee) => !needle || [employee.id, employee.employeeId, employee.name].some((value) => value.toLocaleLowerCase().includes(needle)));
 }
 
-function rankTargetMenu(candidates) {
+function rankTargetMenu(candidates, token, page = 0) {
+  const start = page * RANK_PAGE_SIZE;
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId("rank:target")
+      .setCustomId(`rank:target:${token}:${page}`)
       .setPlaceholder("対象署員を選択")
-      .addOptions(candidates.map((employee) => new StringSelectMenuOptionBuilder()
+      .addOptions(candidates.slice(start, start + RANK_PAGE_SIZE).map((employee) => new StringSelectMenuOptionBuilder()
         .setLabel(truncateDiscord(employee.name, 100))
         .setDescription(`${employee.rank} / ${employee.id}`.slice(0, 100))
         .setValue(employee.id))),
   );
+}
+
+function rankTargetNavigation(token, page, pageCount) {
+  if (pageCount <= 1) return null;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`rank:page:${token}:${page - 1}`)
+      .setLabel("前へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`rank:page:${token}:${page + 1}`)
+      .setLabel(`次へ（${page + 1}/${pageCount}）`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(page >= pageCount - 1),
+  );
+}
+
+function rankTargetComponents(candidates, token, page = 0) {
+  const pageCount = Math.max(1, Math.ceil(candidates.length / RANK_PAGE_SIZE));
+  const components = [rankTargetMenu(candidates, token, page)];
+  const navigation = rankTargetNavigation(token, page, pageCount);
+  if (navigation) components.push(navigation);
+  return { components, pageCount };
 }
 
 async function handleRankCommand(interaction) {
@@ -3677,13 +3704,56 @@ async function handleRankCommand(interaction) {
     await interaction.editReply("該当する在籍署員がいません。検索条件を変えて再実行してください。");
     return;
   }
+  const token = createHash("sha256")
+    .update(`${interaction.user.id}:${Date.now()}:${Math.random()}`)
+    .digest("hex")
+    .slice(0, 10);
+  for (const [oldToken, session] of rankSelectionSessions) {
+    if (Date.now() - session.createdAt > 15 * 60 * 1000) rankSelectionSessions.delete(oldToken);
+  }
+  rankSelectionSessions.set(token, {
+    userId: interaction.user.id,
+    candidates,
+    createdAt: Date.now(),
+  });
+  const view = rankTargetComponents(candidates, token, 0);
   await interaction.editReply({
-    content: "対象署員を選択してください。解雇者は対象外です。",
-    components: [rankTargetMenu(candidates)],
+    content: `対象署員を選択してください。解雇者は対象外です。\n候補者 ${candidates.length}人（ページ 1/${view.pageCount}）`,
+    components: view.components,
   });
 }
 
-async function handleRankTargetSelect(interaction) {
+async function handleRankPageButton(interaction, token, page) {
+  const session = rankSelectionSessions.get(token);
+  if (!session || Date.now() - session.createdAt > 15 * 60 * 1000) {
+    await interaction.update({ content: "候補一覧の有効期限が切れました。/rank を再実行してください。", components: [] });
+    rankSelectionSessions.delete(token);
+    return;
+  }
+  if (session.userId !== interaction.user.id) {
+    await interaction.reply({ content: "この候補一覧を操作できるのは表示した本人だけです。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const pageCount = Math.max(1, Math.ceil(session.candidates.length / RANK_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
+  const view = rankTargetComponents(session.candidates, token, safePage);
+  await interaction.update({
+    content: `対象署員を選択してください。解雇者は対象外です。\n候補者 ${session.candidates.length}人（ページ ${safePage + 1}/${pageCount}）`,
+    components: view.components,
+  });
+}
+
+async function handleRankTargetSelect(interaction, token) {
+  const session = rankSelectionSessions.get(token);
+  if (!session || Date.now() - session.createdAt > 15 * 60 * 1000) {
+    await interaction.update({ content: "候補一覧の有効期限が切れました。/rank を再実行してください。", components: [] });
+    rankSelectionSessions.delete(token);
+    return;
+  }
+  if (session.userId !== interaction.user.id) {
+    await interaction.reply({ content: "この候補一覧を操作できるのは表示した本人だけです。", flags: MessageFlags.Ephemeral });
+    return;
+  }
   const discordId = interaction.values[0];
   await interaction.update({
     content: `対象Discord ID: **${discordId}**\n最初に操作項目を選択してください。`,
@@ -3990,8 +4060,14 @@ client.on("interactionCreate", async (interaction) => {
       await handleStaffProfileBoardTarget(interaction);
       return;
     }
-    if (interaction.isStringSelectMenu() && interaction.customId === "rank:target") {
-      await handleRankTargetSelect(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith("rank:page:")) {
+      const [, , token, page] = interaction.customId.split(":");
+      await handleRankPageButton(interaction, token, Number(page));
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:target:")) {
+      const [, , token] = interaction.customId.split(":");
+      await handleRankTargetSelect(interaction, token);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rank:action:")) {
