@@ -1998,6 +1998,20 @@ async function textChannel(channelId, label) {
   return channel;
 }
 
+function roleMentionPayload(roleId, message = "") {
+  const normalizedRoleId = String(roleId || "").replace(/^'/, "").trim();
+  if (!/^\d{17,20}$/.test(normalizedRoleId)) {
+    return {
+      content: message,
+      allowedMentions: { parse: [] },
+    };
+  }
+  return {
+    content: [`<@&${normalizedRoleId}>`, message].filter(Boolean).join("\n"),
+    allowedMentions: { roles: [normalizedRoleId], parse: [] },
+  };
+}
+
 function pollVerdict(passVotes, totalVotes) {
   if (totalVotes <= 0) return "投票待ち";
   return passVotes * 2 >= totalVotes ? "合格" : "不合格";
@@ -2060,14 +2074,14 @@ async function fetchPollVoteCounts(message) {
   return { passVotes, failVotes };
 }
 
-async function createApplicationPoll(setting, application) {
+async function createApplicationPoll(setting, application, interviewerRoleId = "") {
   const channel = await textChannel(setting.pollChannelId, "投票");
   const existing = await findRecentPoll(channel, (message) => message.embeds?.some((embed) =>
     embed.fields?.some((field) => field.name === "応募ID" && field.value === application.id)));
   if (existing) return pollStateFromMessage(existing);
   const subject = truncateDiscord(application.name || application.discordId || application.id, 220);
   const message = await channel.send({
-    content: setting.pollMessage,
+    ...roleMentionPayload(interviewerRoleId, setting.pollMessage),
     embeds: [applicationEmbed(application, `${setting.roundName} 応募審査`, 0x2563eb)],
     poll: {
       question: { text: `${subject} を合格としますか？` },
@@ -2078,7 +2092,6 @@ async function createApplicationPoll(setting, application) {
       allowMultiselect: false,
       duration: setting.pollDurationHours,
     },
-    allowedMentions: { parse: [] },
     // Stable per-application nonce protects against a restart between Discord
     // send and the spreadsheet state write.
     nonce: discordNonce("docpoll", application.id),
@@ -2301,13 +2314,14 @@ async function processRecruitmentApplications() {
   const now = Date.now();
   if (now - lastRecruitmentPollAt < recruitmentPollIntervalMs) return;
   lastRecruitmentPollAt = now;
-  const [topResponse, settings, applicationResponse] = await Promise.all([
+  const [topResponse, settings, interviewSettings, applicationResponse] = await Promise.all([
     sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${applicationSheetName}'!A4:B4`,
       valueRenderOption: "UNFORMATTED_VALUE",
     }),
     readRecruitmentSettings(),
+    readInterviewSettings(),
     sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${applicationSheetName}'!A11:AD1000`,
@@ -2325,6 +2339,7 @@ async function processRecruitmentApplications() {
   for (const setting of settings) {
     if (!setting.enabled && !setting.manualTrigger) continue;
     try {
+      const interviewerRoleId = interviewSettings.find((item) => item.roundName === setting.roundName)?.interviewerRoleId || "";
       const responseSpreadsheetId = extractSpreadsheetId(setting.responseSpreadsheetUrl);
       if (!responseSpreadsheetId) {
         await writeRecruitmentStatus(setting, "回答スプレッドシートURL待ち");
@@ -2395,7 +2410,7 @@ async function processRecruitmentApplications() {
         if (!application.pollMessageId) {
           if (!setting.pollChannelId) continue;
           try {
-            const state = await createApplicationPoll(setting, application);
+            const state = await createApplicationPoll(setting, application, interviewerRoleId);
             await writeApplicationPollState(application.rowNumber, state);
             const row = rows[application.rowNumber - 11];
             row.splice(14, 10,
@@ -3126,7 +3141,7 @@ async function createInterviewPoll(setting, record) {
     message.embeds?.some((embed) => String(embed.description || "").includes(`応募ID: **${record.applicationId}**`)));
   if (existing) return existing;
   const message = await channel.send({
-    content: setting.pollMessage,
+    ...roleMentionPayload(setting.interviewerRoleId, setting.pollMessage),
     embeds: [interviewPollEmbed(record)],
     poll: {
       question: { text: `${truncateDiscord(record.applicantName || record.applicationId, 220)} を面接合格としますか？` },
@@ -3137,7 +3152,6 @@ async function createInterviewPoll(setting, record) {
       allowMultiselect: false,
       duration: setting.pollDurationHours,
     },
-    allowedMentions: { parse: [] },
     nonce: discordNonce("ivpoll", record.id),
     enforceNonce: true,
   });
