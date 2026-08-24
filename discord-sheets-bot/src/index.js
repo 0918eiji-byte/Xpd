@@ -562,6 +562,7 @@ const terminationSheetName = "解雇者管理";
 const employeeSheetId = 1100459512;
 const employeeSheetName = "署員一覧";
 const retentionPeriodMs = 7 * 24 * 60 * 60 * 1000;
+let lastTerminationValidationAt = 0;
 const bonusDistributionSheetName = "ボーナス配布";
 const bonusDistributionSheetId = 1863429017;
 const bonusRoundSettingsSheetName = "ボーナス回設定";
@@ -773,6 +774,38 @@ async function readTerminations() {
   };
 }
 
+async function ensureTerminationValidation(terminationSheet) {
+  const now = Date.now();
+  if (now - lastTerminationValidationAt < 24 * 60 * 60 * 1000) return;
+  const completeColumn = terminationSheet.headerMap.get("手続き完了");
+  if (completeColumn === undefined) throw new Error(`${terminationSheetName}シートに「手続き完了」列がありません`);
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets.properties(sheetId,title)",
+  });
+  const sheet = metadata.data.sheets?.find((item) => item.properties?.title === terminationSheetName);
+  const sheetId = sheet?.properties?.sheetId;
+  if (sheetId === undefined || sheetId === null) throw new Error(`${terminationSheetName}シートが見つかりません`);
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        setDataValidation: {
+          range: {
+            sheetId,
+            startRowIndex: 2,
+            endRowIndex: 500,
+            startColumnIndex: completeColumn,
+            endColumnIndex: completeColumn + 1,
+          },
+          rule: { condition: { type: "BOOLEAN" }, strict: true, showCustomUi: true },
+        },
+      }],
+    },
+  });
+  lastTerminationValidationAt = now;
+}
+
 function terminationCellRange(terminationSheet, header, rowNumber) {
   const index = terminationSheet.headerMap.get(header);
   if (index === undefined) throw new Error(`${terminationSheetName}シートに「${header}」列がありません。`);
@@ -830,6 +863,11 @@ function sheetDateTime(date) {
 
 async function upsertTerminationRecord(member, finalRank = "") {
   const terminationSheet = await readTerminations();
+  try {
+    await ensureTerminationValidation(terminationSheet);
+  } catch (error) {
+    console.error("解雇者管理のチェックボックス修復失敗:", error.message);
+  }
   const employeeIdColumn = terminationSheet.headerMap.get("社員ID");
   const discordIdColumn = terminationSheet.headerMap.get("DiscordユーザーID");
   const finalRankColumn = terminationSheet.headerMap.get("最終ランク");
@@ -4154,6 +4192,11 @@ client.on("interactionCreate", async (interaction) => {
 
 async function processTerminations() {
   const [terminationSheet, employeeSheet] = await Promise.all([readTerminations(), readEmployees()]);
+  try {
+    await ensureTerminationValidation(terminationSheet);
+  } catch (error) {
+    console.error("解雇者管理のチェックボックス修復失敗:", error.message);
+  }
   const completeColumn = terminationSheet.headerMap.get("手続き完了");
   const completedAtColumn = terminationSheet.headerMap.get("完了日");
   const deletionAtColumn = terminationSheet.headerMap.get("名簿削除予定日");
