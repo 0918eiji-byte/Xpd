@@ -666,6 +666,10 @@ async function readEmployees() {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `'${employeeSheetName}'!A2:ZZ1000`,
+    // Bonus factors are formatted as values such as "3.6x" in the sheet.
+    // Read the underlying numeric value so bonus distribution does not turn
+    // the formatted display text into zero via Number("3.6x").
+    valueRenderOption: "UNFORMATTED_VALUE",
   });
   const values = response.data.values || [];
   let headers = values[0] || [];
