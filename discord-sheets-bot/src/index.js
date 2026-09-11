@@ -141,6 +141,16 @@ function formatDiscordIdError(error, discordId = "") {
   return raw;
 }
 
+function formatRecruitmentSyncError(error, setting) {
+  const raw = String(error?.response?.data?.error?.message || error?.response?.data?.message || error?.message || error || "");
+  if (/caller does not have permission|permission denied|forbidden/i.test(raw)) {
+    const responseSpreadsheetId = extractSpreadsheetId(setting?.responseSpreadsheetUrl);
+    const account = credentials?.client_email || "RailwayのGOOGLE_SERVICE_ACCOUNT_JSONに設定したサービスアカウント";
+    return `回答スプレッドシートへの権限がありません（${responseSpreadsheetId || "URL不正"}）。${account}を対象スプレッドシートへ共有してください。`;
+  }
+  return raw;
+}
+
 function duplicateValues(values) {
   const seen = new Set();
   const duplicates = new Set();
@@ -2569,7 +2579,7 @@ async function processRecruitmentApplications() {
         `稼働中: 応募${roundApplications.length}件 / 新規${newRows.length}件 / 投票作成${pollCreatedCount}件 / 更新${pollUpdatedCount}件 / ロール${documentRoleCount}件 / PREVIEW${previewCount}件 / FINAL${finalCount}件 / 締切${setting.pollDurationHours}時間または${setting.pollVoteLimit}票${announcementStatus}${channelWait}`,
       );
     } catch (error) {
-      const message = error.response?.data?.error?.message || error.message || String(error);
+      const message = formatRecruitmentSyncError(error, setting);
       // A quota error must not trigger a second status write, which would
       // prolong the outage. The central scheduler will retry automatically.
       if (isSheetsQuotaError(error)) throw error;
