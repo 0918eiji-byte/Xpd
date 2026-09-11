@@ -209,8 +209,12 @@ async function auditUnifiedSettings(force = false) {
       for (const [value, label] of [[row[3], "投票"], [row[7], "合格発表"], [row[13], "書類合格ロール"]]) {
         if (normalizedId(value) && !snowflake.test(normalizedId(value))) errors.push(`書類選考の${label}IDが不正`);
       }
-      if (!(Number(row[5]) >= 1 && Number(row[5]) <= 168)) errors.push("書類選考の期限は1～168時間");
-      if (!(Number(row[6]) >= 1 && Number(row[6]) <= 1000)) errors.push("書類選考の締切票数は1～1000");
+      // Blank optional limits use the same safe defaults as the runtime parser
+      // (24 hours / 5 votes).  Only validate values when an administrator has
+      // actually entered one; otherwise a blank cell incorrectly invalidates
+      // the whole unified settings snapshot and forces legacy fallback.
+      if (String(row[5] ?? "").trim() && !(Number(row[5]) >= 1 && Number(row[5]) <= 168)) errors.push("書類選考の期限は1～168時間");
+      if (String(row[6] ?? "").trim() && !(Number(row[6]) >= 1 && Number(row[6]) <= 1000)) errors.push("書類選考の締切票数は1～1000");
     }
     if (duplicateValues(rounds).length) errors.push("書類選考の募集回が重複");
     const interviewRounds = [];
@@ -221,8 +225,8 @@ async function auditUnifiedSettings(force = false) {
       for (const [value, label] of [[row[2], "実行チャンネル"], [row[3], "面接官ロール"], [row[4], "投票チャンネル"], [row[8], "合格発表チャンネル"], [row[15], "面接合格ロール"]]) {
         if (normalizedId(value) && !snowflake.test(normalizedId(value))) errors.push(`面接の${label}IDが不正`);
       }
-      if (!(Number(row[6]) >= 1 && Number(row[6]) <= 168)) errors.push("面接の期限は1～168時間");
-      if (!(Number(row[7]) >= 1 && Number(row[7]) <= 1000)) errors.push("面接の締切票数は1～1000");
+      if (String(row[6] ?? "").trim() && !(Number(row[6]) >= 1 && Number(row[6]) <= 168)) errors.push("面接の期限は1～168時間");
+      if (String(row[7] ?? "").trim() && !(Number(row[7]) >= 1 && Number(row[7]) <= 1000)) errors.push("面接の締切票数は1～1000");
     }
     if (duplicateValues(interviewRounds).length) errors.push("面接の募集回が重複");
     const activeQuestions = questionRows.filter((row) => String(row[0] || "").trim() === "はい");
