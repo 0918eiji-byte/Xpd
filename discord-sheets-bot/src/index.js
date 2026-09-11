@@ -1497,6 +1497,18 @@ function formValue(headers, row, aliases, fallbackIndex = -1) {
   return index >= 0 ? row[index] ?? "" : "";
 }
 
+function normalizeRoundName(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^第([一二三四五六七八九十]+)回$/);
+  if (!match) return text;
+  const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+  const numeral = match[1];
+  if (numeral.length === 1) return `第${digits[numeral] || numeral}回`;
+  if (numeral.startsWith("十") && numeral.length === 2) return `第${10 + (digits[numeral[1]] || 0)}回`;
+  if (numeral.endsWith("十") && numeral.length === 2) return `第${(digits[numeral[0]] || 0) * 10}回`;
+  return text;
+}
+
 function discordNumericId(value) {
   return String(value || "").replace(/^'/, "").match(/\d{17,20}/)?.[0] || "";
 }
@@ -1546,7 +1558,7 @@ function recruitmentSettingFromRow(row, index, firstRow = 4, source = "legacy") 
     rowNumber: index + firstRow,
     source,
     enabled: String(row[0] || "").trim() === "はい",
-    roundName: String(row[1] || "").trim(),
+    roundName: normalizeRoundName(row[1]),
     responseSpreadsheetUrl: String(row[2] || "").trim(),
     responseSheetName: "",
     pollChannelId: String(row[3] || "").trim(),
@@ -1751,7 +1763,7 @@ function applicationFromSheetRow(row, rowNumber) {
     pollMessageId: String(row[21] || "").replace(/^'/, "").trim(),
     pollChannelId: String(row[22] || "").replace(/^'/, "").trim(),
     processResult: String(row[23] || "").trim(),
-    roundName: String(row[24] || "").trim(),
+    roundName: normalizeRoundName(row[24]),
     passAnnouncementMessageId: String(row[26] || "").replace(/^'/, "").trim(),
     resolvedDiscordId: storedDiscordId(row[27]),
     documentRoleStatus: String(row[28] || "").trim(),
@@ -2619,7 +2631,7 @@ function interviewSettingFromRow(row, index, firstRow = 4, source = "legacy") {
     rowNumber: index + firstRow,
     source,
     enabled: String(row[0] || "").trim() === "はい",
-    roundName: String(row[1] || "").trim(),
+    roundName: normalizeRoundName(row[1]),
     commandChannelId: String(row[2] || "").replace(/^'/, "").trim(),
     interviewerRoleId: String(row[3] || "").replace(/^'/, "").trim(),
     pollChannelId: String(row[4] || "").replace(/^'/, "").trim(),
@@ -2725,7 +2737,7 @@ function interviewRecordFromRow(row, rowNumber) {
     rowNumber,
     id: String(row[0] || "").trim(),
     applicationId: String(row[1] || "").trim(),
-    roundName: String(row[2] || "").trim(),
+    roundName: normalizeRoundName(row[2]),
     applicantName: String(row[3] || "").trim(),
     applicantDiscordName: String(row[4] || "").trim(),
     applicantDiscordId: storedDiscordId(row[5]),
