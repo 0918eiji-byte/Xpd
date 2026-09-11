@@ -580,6 +580,7 @@ let displayedBonusRound = "";
 const recruitmentSettingsSheetName = "募集設定";
 const applicationSheetName = "応募者管理";
 const applicationSheetId = 2081134610;
+const reviewPollMentionRoleId = "1496685125046636584";
 let displayedApplicationRound = "";
 let lastRecruitmentPollAt = 0;
 const recruitmentPollIntervalMs = Math.max(Number(process.env.RECRUITMENT_POLL_INTERVAL_MS || 60000), 30000);
@@ -2050,17 +2051,25 @@ async function textChannel(channelId, label) {
   return channel;
 }
 
-function roleMentionPayload(roleId, message = "") {
-  const normalizedRoleId = String(roleId || "").replace(/^'/, "").trim();
-  if (!/^\d{17,20}$/.test(normalizedRoleId)) {
+function roleMentionPayload(roleIds, message = "") {
+  const normalizedRoleIds = [...new Set((Array.isArray(roleIds) ? roleIds : [roleIds])
+    .map((roleId) => String(roleId || "").replace(/^'/, "").trim())
+    .filter((roleId) => /^\d{17,20}$/.test(roleId)))];
+  const cleanedMessage = normalizedRoleIds.reduce(
+    (value, roleId) => value.replaceAll(`<@&${roleId}>`, ""),
+    String(message || ""),
+  ).replace(/\n{3,}/g, "\n").trim();
+  if (!normalizedRoleIds.length) {
     return {
-      content: message,
+      content: cleanedMessage,
       allowedMentions: { parse: [] },
     };
   }
   return {
-    content: [`<@&${normalizedRoleId}>`, message].filter(Boolean).join("\n"),
-    allowedMentions: { roles: [normalizedRoleId], parse: [] },
+    content: [normalizedRoleIds.map((roleId) => `<@&${roleId}>`).join(" "), cleanedMessage]
+      .filter(Boolean)
+      .join("\n"),
+    allowedMentions: { roles: normalizedRoleIds, parse: [] },
   };
 }
 
@@ -2133,7 +2142,7 @@ async function createApplicationPoll(setting, application, interviewerRoleId = "
   if (existing) return pollStateFromMessage(existing);
   const subject = truncateDiscord(application.name || application.discordId || application.id, 220);
   const message = await channel.send({
-    ...roleMentionPayload(interviewerRoleId, setting.pollMessage),
+    ...roleMentionPayload([reviewPollMentionRoleId, interviewerRoleId], setting.pollMessage),
     embeds: [applicationEmbed(application, `${setting.roundName} 応募審査`, 0x2563eb)],
     poll: {
       question: { text: `${subject} を合格としますか？` },
@@ -3193,7 +3202,7 @@ async function createInterviewPoll(setting, record) {
     message.embeds?.some((embed) => String(embed.description || "").includes(`応募ID: **${record.applicationId}**`)));
   if (existing) return existing;
   const message = await channel.send({
-    ...roleMentionPayload(setting.interviewerRoleId, setting.pollMessage),
+    ...roleMentionPayload([reviewPollMentionRoleId, setting.interviewerRoleId], setting.pollMessage),
     embeds: [interviewPollEmbed(record)],
     poll: {
       question: { text: `${truncateDiscord(record.applicantName || record.applicationId, 220)} を面接合格としますか？` },
