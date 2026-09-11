@@ -378,6 +378,15 @@ function enqueueDiscordOperation(label, work) {
   return discordOperationQueue;
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function readRankMap() {
   const unified = await unifiedRange("rank");
   const response = unified || await sheets.spreadsheets.values.get({
@@ -3769,12 +3778,21 @@ function rankTargetComponents(candidates, token, page = 0) {
 
 async function handleRankCommand(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const settings = await readRankOperationSettings();
+  const settingsPromise = withTimeout(
+    readRankOperationSettings(),
+    12000,
+    "Google Sheetsの設定読込がタイムアウトしました。少し待ってから再試行してください。",
+  );
+  const candidatesPromise = withTimeout(
+    rankEmployeeCandidates(interaction.options?.getString?.("search") || ""),
+    12000,
+    "Google Sheetsの署員一覧読込がタイムアウトしました。少し待ってから再試行してください。",
+  );
+  const [settings, candidates] = await Promise.all([settingsPromise, candidatesPromise]);
   if (!rankOperationPermission(interaction, settings)) {
     await interaction.editReply("ランク操作の管理ロールが設定されていないか、実行権限がありません。");
     return;
   }
-  const candidates = await rankEmployeeCandidates(interaction.options?.getString?.("search") || "");
   if (!candidates.length) {
     await interaction.editReply("該当する在籍署員がいません。検索条件を変えて再実行してください。");
     return;
@@ -3851,8 +3869,12 @@ async function handleRankTargetSelect(interaction, token) {
 
 async function handleRankActionSelect(interaction, discordId) {
   const action = interaction.values[0];
+  // A rank change needs a Sheets read to build the destination-rank menu.
+  // Acknowledge the component immediately so Discord does not leave the
+  // select menu in an endless loading state while Sheets responds.
+  await interaction.deferUpdate();
   if (["警告", "報告"].includes(action)) {
-    await interaction.update({
+    await interaction.editReply({
       content: `操作: **${action}**\nランクは変更しません。備考を入力してください。`,
       components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -3863,10 +3885,10 @@ async function handleRankActionSelect(interaction, discordId) {
     });
     return;
   }
-  const [guild, rankMap] = await Promise.all([
+  const [guild, rankMap] = await withTimeout(Promise.all([
     client.guilds.cache.get(guildId) || client.guilds.fetch(guildId),
     readRankMap(),
-  ]);
+  ]), 12000, "ランク設定の読込がタイムアウトしました。少し待ってから再試行してください。");
   const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId);
   const current = assessMember(member, rankMap).rankName || "？？？？";
   const currentRank = rankByName(rankMap, current);
@@ -3874,7 +3896,7 @@ async function handleRankActionSelect(interaction, discordId) {
     .filter((rank) => !currentRank || (action === "昇格" ? rank.priority < currentRank.priority : rank.priority > currentRank.priority))
     .slice(0, 25);
   if (!ranks.length) throw new Error(`${action}できる変更先ランクがありません。`);
-  await interaction.update({
+  await interaction.editReply({
     content: `対象: **${truncateDiscord(member.displayName, 100)}**\n現在のランク: **${current}**\n操作: **${action}**\n変更後ランクを選択してください。`,
     components: [new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
