@@ -1501,6 +1501,11 @@ function discordNumericId(value) {
   return String(value || "").replace(/^'/, "").match(/\d{17,20}/)?.[0] || "";
 }
 
+function storedDiscordId(value) {
+  const candidate = String(value || "").replace(/^'/, "").trim();
+  return /^\d{17,20}$/.test(candidate) ? candidate : "";
+}
+
 function normalizeDiscordUsername(value) {
   return String(value || "").replace(/^'/, "").replace(/^@/, "").trim().toLowerCase();
 }
@@ -1748,7 +1753,7 @@ function applicationFromSheetRow(row, rowNumber) {
     processResult: String(row[23] || "").trim(),
     roundName: String(row[24] || "").trim(),
     passAnnouncementMessageId: String(row[26] || "").replace(/^'/, "").trim(),
-    resolvedDiscordId: String(row[27] || "").replace(/^'/, "").trim(),
+    resolvedDiscordId: storedDiscordId(row[27]),
     documentRoleStatus: String(row[28] || "").trim(),
     roleUpdatedAt: row[29] || "",
   };
@@ -2723,8 +2728,8 @@ function interviewRecordFromRow(row, rowNumber) {
     roundName: String(row[2] || "").trim(),
     applicantName: String(row[3] || "").trim(),
     applicantDiscordName: String(row[4] || "").trim(),
-    applicantDiscordId: String(row[5] || "").replace(/^'/, "").trim(),
-    interviewerId: String(row[6] || "").replace(/^'/, "").trim(),
+    applicantDiscordId: storedDiscordId(row[5]),
+    interviewerId: storedDiscordId(row[6]),
     interviewerName: String(row[7] || "").trim(),
     startedAt: row[8] || "",
     completedAt: row[9] || "",
