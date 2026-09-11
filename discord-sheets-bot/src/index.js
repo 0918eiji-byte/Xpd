@@ -2844,6 +2844,7 @@ async function readStep1Applications() {
 
 async function eligibleInterviewApplications(setting, search = "") {
   const [applications, records] = await Promise.all([readStep1Applications(), readInterviewRecords()]);
+  const targetRound = normalizeRoundName(setting?.roundName);
   const activeRecords = records.filter((record) => record.interviewStatus !== "CANCELLED");
   const reserved = new Set(activeRecords
     .map((record) => record.applicationId));
@@ -2852,10 +2853,10 @@ async function eligibleInterviewApplications(setting, search = "") {
   )).filter(Boolean));
   const needle = String(search || "").trim().toLowerCase();
   const candidates = applications.filter((application) => (
-    application.roundName === setting.roundName
+    normalizeRoundName(application.roundName) === targetRound
     && application.pollStatus === "FINAL"
     && application.verdict === "合格"
-    && application.documentRoleStatus.startsWith("書類合格ロール付与済")
+    && /^書類合格ロール付与済/.test(application.documentRoleStatus)
     && (!needle || [application.id, application.name, application.discordId]
       .some((value) => String(value || "").toLowerCase().includes(needle)))
   ));
@@ -2864,9 +2865,11 @@ async function eligibleInterviewApplications(setting, search = "") {
     const key = application.resolvedDiscordId || normalizeDiscordUsername(application.discordId) || application.id;
     latestByApplicant.set(key, application);
   }
-  return [...latestByApplicant.entries()]
+  const eligible = [...latestByApplicant.entries()]
     .filter(([key, application]) => !reserved.has(application.id) && !reservedApplicants.has(key))
     .map(([, application]) => application);
+  console.log(`面接候補確認: 対象回=${targetRound || "未設定"} 応募=${applications.length} / 条件一致=${candidates.length} / 予約除外後=${eligible.length}`);
+  return eligible;
 }
 
 function interviewQuestionSnapshot(questions) {
