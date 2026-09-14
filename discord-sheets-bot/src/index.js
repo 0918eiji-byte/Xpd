@@ -798,6 +798,7 @@ function employeeFormulas(employeeSheet, rowNumber) {
   const appliedRank = ref(employeeSheet, "適用ランク", rowNumber);
   return {
     [bonusFactorHeader]: `=IF(${id}="","",IF('設定'!$K$3="v2:READY",IFNA(XLOOKUP(${appliedRank},'設定'!$B$10:$B$109,'設定'!$E$10:$E$109),0),IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$E$3:$E$1000),0)))`,
+    [sortPriorityHeader]: `=IF(${id}="","",IF('設定'!$K$3="v2:READY",IFNA(XLOOKUP(${appliedRank},'設定'!$B$10:$B$109,'設定'!$A$10:$A$109),9999),IFNA(XLOOKUP(${appliedRank},'ランク設定'!$B$3:$B$1000,'ランク設定'!$A$3:$A$1000),9999)))`,
   };
 }
 
@@ -1082,7 +1083,7 @@ async function syncMember(member, context = null) {
 
   if (index < 0) {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, [sortPriorityHeader]: assessed.priority, ...employeeFormulas(employeeSheet, targetRow) }),
+      rowUpdate(employeeSheet, targetRow, { "社員ID": employeeId(member.id), "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, ...employeeFormulas(employeeSheet, targetRow) }),
       context,
     );
     const rowIndex = targetRow - 3;
@@ -1090,7 +1091,7 @@ async function syncMember(member, context = null) {
     employeeSheet.rows[rowIndex][idColumn] = employeeId(member.id);
   } else {
     await applyEmployeeUpdates(
-      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, [sortPriorityHeader]: assessed.priority }),
+      rowUpdate(employeeSheet, targetRow, { "表示名": member.displayName, "Discordロール": assessed.roleNames, "適用ランク": appliedRank, ...employeeFormulas(employeeSheet, targetRow) }),
       context,
     );
   }
