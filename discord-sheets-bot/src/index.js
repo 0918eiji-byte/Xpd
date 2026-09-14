@@ -637,8 +637,18 @@ async function ensureRankAndEmployeeValidation() {
   const enabledRankNames = rankRows
     .filter((row) => isEnabledSetting(row?.[5]) && String(row?.[1] || "").trim())
     .map((row) => String(row[1]).trim());
+  const selectableRankNames = [...new Set([
+    ...enabledRankNames.filter((name) => name !== "解雇者"),
+    "？？？？",
+  ])];
+  const changeRankNames = [...new Set([
+    ...enabledRankNames.filter((name) => name !== "解雇者"),
+    "解雇",
+    "？？？？",
+  ])];
   const rankColumn = employeeSheet.headerMap.get(rankSelectionHeader);
   const triggerColumn = employeeSheet.headerMap.get(actionTriggerHeader);
+  const appliedRankColumn = employeeSheet.headerMap.get("適用ランク");
   const requests = [
     {
       setDataValidation: {
@@ -658,7 +668,15 @@ async function ensureRankAndEmployeeValidation() {
     requests.push({
       setDataValidation: {
         range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: rankColumn, endColumnIndex: rankColumn + 1 },
-        rule: { condition: { type: "ONE_OF_LIST", values: enabledRankNames.map((value) => ({ userEnteredValue: value })) }, strict: false, showCustomUi: true },
+        rule: { condition: { type: "ONE_OF_LIST", values: changeRankNames.map((value) => ({ userEnteredValue: value })) }, strict: false, showCustomUi: true },
+      },
+    });
+  }
+  if (appliedRankColumn !== undefined) {
+    requests.push({
+      setDataValidation: {
+        range: { sheetId: employeeSheetId, startRowIndex: 2, endRowIndex: 1000, startColumnIndex: appliedRankColumn, endColumnIndex: appliedRankColumn + 1 },
+        rule: { condition: { type: "ONE_OF_LIST", values: selectableRankNames.map((value) => ({ userEnteredValue: value })) }, strict: false, showCustomUi: true },
       },
     });
   }
@@ -4395,7 +4413,15 @@ async function fullSync() {
   await consolidateEmployeeDuplicates();
   const employeeSheet = await readEmployees();
   const context = { rankMap, employeeSheet, pendingData: [], pendingClearRanges: [], silent: true };
-  for (const member of members.values()) await syncMember(member, context);
+  let syncWarnings = 0;
+  for (const member of members.values()) {
+    try {
+      await syncMember(member, context);
+    } catch (error) {
+      syncWarnings += 1;
+      console.error(`全件同期の個別処理失敗: ${member.displayName || member.user?.username || member.id}`, error.message);
+    }
+  }
   if (context.pendingClearRanges.length) {
     await sheets.spreadsheets.values.batchClear({
       spreadsheetId,
@@ -4409,7 +4435,7 @@ async function fullSync() {
     });
   }
   await sortEmployees(employeeSheet);
-  console.log(`全件同期完了: ${members.size}人確認`);
+  console.log(`全件同期完了: ${members.size}人確認 / 個別警告${syncWarnings}件`);
 }
 
 async function markRemoved(member) {
