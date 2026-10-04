@@ -1707,7 +1707,16 @@ function responseApplication(headers, row) {
     reason: String(formValue(headers, row, ["志望理由"])).trim(),
     strength: String(formValue(headers, row, ["PD業務で得意なこと", "得意なこと"])).trim(),
     prosCons: String(formValue(headers, row, ["自分の長所と短所", "長所と短所"])).trim(),
-    ideal: String(formValue(headers, row, ["あなたが希望する部署の理想のPDは", "理想のPD"])).trim(),
+    // The sixth-form question is worded differently from the earlier forms.
+    // Keep the header lookup first (so column order can change), with the
+    // stable form position as a final compatibility fallback for legacy
+    // response sheets that have no usable header text.
+    ideal: String(formValue(headers, row, [
+      "あなたが希望する部署の理想のPDは",
+      "あなたがPDに入ってしたいことを教えてください",
+      "あなたがPDに入ってしたいこと",
+      "理想のPD",
+    ], 10)).trim(),
     whitelist: String(formValue(headers, row, ["ホワイトリスト申請の文言は", "ホワイトリスト"])).trim(),
     question: String(formValue(headers, row, ["質問等あれば記入して下さい", "質問"])).trim(),
   };
