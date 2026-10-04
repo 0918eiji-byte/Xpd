@@ -3114,7 +3114,16 @@ async function updateInterviewRecord(record, valuesByColumn) {
 
 async function settingForInteraction(interaction) {
   const settings = await readInterviewSettings();
-  return settings.find((setting) => setting.commandChannelId === interaction.channelId) || null;
+  const matches = settings.filter((setting) => setting.commandChannelId === interaction.channelId);
+  if (!matches.length) return null;
+  // Several recruitment rounds intentionally share one interview channel.
+  // Do not depend on sheet row order (which made the older fifth-round row
+  // mask the active sixth-round applicants); use the newest enabled round.
+  return matches.sort((left, right) => {
+    const leftRound = Number(String(left.roundName || "").match(/\d+/)?.[0] || -1);
+    const rightRound = Number(String(right.roundName || "").match(/\d+/)?.[0] || -1);
+    return rightRound - leftRound;
+  })[0];
 }
 
 async function handleInterviewCommand(interaction) {
