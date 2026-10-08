@@ -18,6 +18,7 @@ import {
   TextInputStyle,
 } from "discord.js";
 import { google } from "googleapis";
+import { rankSyncDecision } from "./rank-sync-policy.js";
 
 const required = [
   "DISCORD_BOT_TOKEN",
@@ -1247,33 +1248,24 @@ async function processSheetActions() {
       }
 
       const sheetRank = String(row[appliedRankColumn] || "").trim();
-      if (!sheetRank || sheetRank === discordRank) {
+      const syncDecision = rankSyncDecision({ triggered, sheetRank, discordRank });
+      if (syncDecision === "none") {
         lastSynchronizedRanks.set(discordId, discordRank);
         await writeActionResult(employeeSheet, rowNumber, { [currentStatusHeader]: `在籍中: ${discordRank}` });
         continue;
       }
 
-      const lastRank = lastSynchronizedRanks.get(discordId);
-      if (lastRank === discordRank) {
-        const result = await applySelectedRank(guild, member, rankMap, sheetRank, "Google Sheetsの適用ランク直接編集");
-        await syncMember(await guild.members.fetch(discordId));
-        needsSort = true;
-        await writeActionResult(employeeSheet, rowNumber, {
-          "操作結果": `完了: スプシ → Discord (${result.transition})`,
-          [currentStatusHeader]: `在籍中: ${sheetRank}`,
-          "操作日時": new Date().toISOString(),
-        });
-        console.log(`双方向同期: スプシ → Discord ${member.displayName} ${result.transition}`);
-      } else {
-        await syncMember(member);
-        needsSort = true;
-        await writeActionResult(employeeSheet, rowNumber, {
-          "操作結果": `完了: Discord → スプシ (${discordRank})`,
-          [currentStatusHeader]: `在籍中: ${discordRank}`,
-          "操作日時": new Date().toISOString(),
-        });
-        console.log(`双方向同期: Discord → スプシ ${member.displayName} ${discordRank}`);
-      }
+      // A mismatch without the explicit action checkbox is a Discord-side
+      // change (or a stale sheet value).  Never change roles implicitly from
+      // the polling loop; only the checked action path above may do that.
+      await syncMember(member);
+      needsSort = true;
+      await writeActionResult(employeeSheet, rowNumber, {
+        "操作結果": `完了: Discord → スプシ (${discordRank})`,
+        [currentStatusHeader]: `在籍中: ${discordRank}`,
+        "操作日時": new Date().toISOString(),
+      });
+      console.log(`双方向同期: Discord → スプシ ${member.displayName} ${discordRank}`);
     } catch (error) {
       const message = formatDiscordIdError(error, discordId);
       await writeActionResult(employeeSheet, rowNumber, {
