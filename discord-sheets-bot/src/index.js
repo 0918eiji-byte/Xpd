@@ -2346,7 +2346,8 @@ function isActiveStep1Pass(application) {
 }
 
 async function reconcileStep1DocumentRole(guild, setting, application, allApplications = []) {
-  if (application.pollStatus !== "FINAL" || !["合格", "不合格"].includes(application.verdict)) return false;
+  const revokeRequested = application.documentRoleStatus.startsWith("書類合格ロール解除要求");
+  if (application.pollStatus !== "FINAL" || (!revokeRequested && !["合格", "不合格"].includes(application.verdict))) return false;
   const documentRoleId = configuredRoleId(guild, setting.documentPassRoleId, ["書類合格者", "書類合格"]);
   if (!documentRoleId) {
     if (application.verdict === "合格" && !application.documentRoleStatus) {
@@ -2354,9 +2355,17 @@ async function reconcileStep1DocumentRole(guild, setting, application, allApplic
     }
     return false;
   }
+  // Manual, per-applicant revocation. Keep the document decision intact and
+  // do not let the next poll immediately re-add the pass role.
+  if (application.documentRoleStatus.startsWith("書類合格ロール解除済")) return false;
   if (application.documentRoleStatus.startsWith("面接結果反映済") || application.documentRoleStatus.startsWith("採用完了")) return false;
   try {
     const { userId, member } = await resolveApplicationMember(guild, application);
+    if (revokeRequested) {
+      const result = await reconcileMemberRoles(guild, member, { remove: [documentRoleId] }, `STEP1書類合格ロール手動解除: ${application.id}`);
+      await updateApplicationRoleState(application, userId, "書類合格ロール解除済（手動）");
+      return result.removed.length > 0;
+    }
     if (application.verdict === "合格") {
       const result = await reconcileMemberRoles(guild, member, { add: [documentRoleId] }, `STEP1書類合格: ${application.id}`);
       const status = "書類合格ロール付与済";
